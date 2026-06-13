@@ -450,30 +450,50 @@ impl EntryMut<'_> {
 
     /// Remove an attachment by name from this entry.
     ///
-    /// If it was the last reference to the attachment, remove it from the database.
+    /// This drops only *this* entry version's reference to the attachment. The
+    /// binary itself is retained in the database pool even if no live reference
+    /// remains, because historical versions of this (or another) entry may still
+    /// reference it. This mirrors [`EntryMut::set_icon_none`], which likewise
+    /// never garbage-collects a custom icon that history may still need. See the
+    /// note on [`EntryMut::remove_attachment_by_id`].
     pub fn remove_attachment_by_name(&mut self, name: &str) {
         let id = self.id;
+        let history_index = self.history_index;
 
-        // remove the attachment reference from this entry
+        // remove the attachment reference from this entry version
         if let Some(attachment_id) = self.attachments.remove(name) {
             if let Some(mut attachment) = self.database.attachment_mut(attachment_id) {
-                attachment.entries.retain(|&(entry_id, _)| entry_id != id);
-
-                // if this was the last entry referencing the attachment, remove it from the database
-                if attachment.entries.is_empty() {
-                    attachment.remove();
-                }
+                // Drop only this exact (entry, version) back-reference, mirroring
+                // set_icon_none. Do NOT garbage-collect the binary: a historical
+                // entry version may still reference it, and freeing the id here
+                // would let AttachmentId::next_free reuse it, silently
+                // re-resolving a stale history reference to a different binary.
+                attachment
+                    .entries
+                    .retain(|&(entry_id, hidx)| !(entry_id == id && hidx == history_index));
             }
         }
     }
 
     /// Remove an attachment by id from this entry.
     ///
-    /// If it was the last reference to the attachment, remove it from the database.
+    /// This drops only *this* entry version's reference to the attachment. The
+    /// binary itself is retained in the database pool even if no live reference
+    /// remains, because historical versions of this (or another) entry may still
+    /// reference it. This mirrors [`EntryMut::set_icon_none`], which likewise
+    /// never garbage-collects a custom icon that history may still need.
+    ///
+    /// Retaining the binary (rather than GC'ing on the last *live* reference,
+    /// keyed by entry id only) prevents two failure modes for callers that keep
+    /// entry history: losing a binary a historical version still references, and
+    /// `AttachmentId::next_free` reusing a freed id and silently re-resolving a
+    /// stale history reference to a different binary. Pruning genuinely orphaned
+    /// binaries is left to save-time pool rebuilding (as KeePassXC does).
     pub fn remove_attachment_by_id(&mut self, attachment_id: AttachmentId) {
         let id = self.id;
+        let history_index = self.history_index;
 
-        // remove the attachment reference from this entry
+        // remove the attachment reference from this entry version
         let mut names_to_remove = Vec::new();
         for (name, &att_id) in &self.attachments {
             if att_id == attachment_id {
@@ -486,12 +506,11 @@ impl EntryMut<'_> {
         }
 
         if let Some(mut attachment) = self.database.attachment_mut(attachment_id) {
-            attachment.entries.retain(|&(entry_id, _)| entry_id != id);
-
-            // if this was the last entry referencing the attachment, remove it from the database
-            if attachment.entries.is_empty() {
-                attachment.remove();
-            }
+            // Drop only this exact (entry, version) back-reference; never GC the
+            // binary (see method doc and remove_attachment_by_name).
+            attachment
+                .entries
+                .retain(|&(entry_id, hidx)| !(entry_id == id && hidx == history_index));
         }
     }
 
