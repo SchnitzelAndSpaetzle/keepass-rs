@@ -16,7 +16,7 @@ pub mod timestamp;
 use serde::{Deserialize, Serialize, Serializer};
 
 use base64::{engine::general_purpose as base64_engine, Engine as _};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -114,7 +114,6 @@ impl KeePassFile {
         for (i, header_attachment) in header_attachments.iter().enumerate() {
             let attachment = crate::db::Attachment {
                 id: crate::db::AttachmentId::new(i),
-                entries: HashSet::new(),
                 data: header_attachment.clone(),
             };
             attachments.insert(attachment.id, attachment);
@@ -126,14 +125,7 @@ impl KeePassFile {
                 let id = crate::db::AttachmentId::next_free(&db);
                 let data = binary.xml_to_db(inner_decryptor)?;
 
-                attachments.insert(
-                    id,
-                    crate::db::Attachment {
-                        id,
-                        entries: HashSet::new(),
-                        data,
-                    },
-                );
+                attachments.insert(id, crate::db::Attachment { id, data });
             }
         }
 
@@ -207,30 +199,9 @@ impl KeePassFile {
             }
         }
 
-        // Re-populate Attachment back-reference sets with the live (current-version) references.
-        //
-        // As with custom icons above, the XML parser creates Attachment values with empty `entries`
-        // sets because binary data and entry data live in separate parts of the XML file. Only live
-        // references are cached here: historical referrers are derived on demand from the forward
-        // `name -> AttachmentId` maps (see `Database::attachment_referrers`), because a cached
-        // positional history index cannot be kept accurate when history snapshots shift it. The
-        // references are collected first and applied afterwards to keep the borrow on `db.entries`
-        // disjoint from the mutable borrow on `db.attachments`.
-        let mut attachment_refs: Vec<(crate::db::AttachmentId, (crate::db::EntryId, Option<usize>))> =
-            Vec::new();
-        let entry_ids: Vec<crate::db::EntryId> = db.entries.keys().copied().collect();
-        for entry_id in entry_ids {
-            if let Some(entry) = db.entries.get(&entry_id) {
-                for &attachment_id in entry.attachments.values() {
-                    attachment_refs.push((attachment_id, (entry_id, None)));
-                }
-            }
-        }
-        for (attachment_id, reference) in attachment_refs {
-            if let Some(attachment) = db.attachments.get_mut(&attachment_id) {
-                attachment.entries.insert(reference);
-            }
-        }
+        // Attachments need no back-reference reconstruction: the entries that reference an attachment
+        // are derived on demand from the forward `name -> AttachmentId` maps (see
+        // `Database::attachment_referrers`), which is always accurate and never stale.
 
         let group_ids: Vec<crate::db::GroupId> = db.groups.keys().copied().collect();
         for group_id in group_ids {

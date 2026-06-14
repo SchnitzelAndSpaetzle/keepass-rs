@@ -242,34 +242,20 @@ impl Database {
             .then(move || AttachmentMut::new(self, id))
     }
 
-    /// Map each still-referenced attachment id to the `(EntryId, history_index)` pairs that
-    /// reference it across every live and history entry. This walk over the entries' `name ->
-    /// AttachmentId` maps is the authoritative source of truth for which binaries are in use.
-    pub(crate) fn attachment_references(
-        &self,
-    ) -> HashMap<AttachmentId, std::collections::HashSet<(EntryId, Option<usize>)>> {
-        use std::collections::HashSet;
-
-        let mut referenced: HashMap<AttachmentId, HashSet<(EntryId, Option<usize>)>> = HashMap::new();
-        for (&entry_id, entry) in &self.entries {
-            for &attachment_id in entry.attachments.values() {
-                referenced
-                    .entry(attachment_id)
-                    .or_default()
-                    .insert((entry_id, None));
-            }
+    /// Collect the set of attachment ids referenced by any live or history entry, derived from the
+    /// entries' forward `name -> AttachmentId` maps. This is the authoritative source of truth for
+    /// which binaries are in use.
+    pub(crate) fn referenced_attachment_ids(&self) -> std::collections::HashSet<AttachmentId> {
+        let mut ids = std::collections::HashSet::new();
+        for entry in self.entries.values() {
+            ids.extend(entry.attachments.values().copied());
             if let Some(history) = entry.history.as_ref() {
-                for (i, hist_entry) in history.entries.iter().enumerate() {
-                    for &attachment_id in hist_entry.attachments.values() {
-                        referenced
-                            .entry(attachment_id)
-                            .or_default()
-                            .insert((entry_id, Some(i)));
-                    }
+                for hist_entry in &history.entries {
+                    ids.extend(hist_entry.attachments.values().copied());
                 }
             }
         }
-        referenced
+        ids
     }
 
     /// Collect the `(EntryId, history_index)` versions that currently reference the given attachment
@@ -303,10 +289,9 @@ impl Database {
     /// referenced and present in the pool. Unreferenced (deleted) binaries are excluded. Ordered by
     /// the underlying id for deterministic output.
     pub(crate) fn attachment_compaction_remap(&self) -> HashMap<AttachmentId, AttachmentId> {
-        let referenced = self.attachment_references();
-        let mut old_ids: Vec<AttachmentId> = referenced
-            .keys()
-            .copied()
+        let mut old_ids: Vec<AttachmentId> = self
+            .referenced_attachment_ids()
+            .into_iter()
             .filter(|id| self.attachments.contains_key(id))
             .collect();
         old_ids.sort_by_key(|id| id.id());
@@ -336,14 +321,16 @@ impl Database {
     /// 1. walks every live and history entry to determine which attachments are still referenced,
     /// 2. removes binaries referenced by no live or history version,
     /// 3. re-indexes the surviving binaries to a contiguous `0..n` id range, and
-    /// 4. rewrites every live/history `name -> AttachmentId` reference (and each attachment's
-    ///    back-reference set) to the new ids.
+    /// 4. rewrites every live/history `name -> AttachmentId` reference to the new ids.
     ///
     /// Re-indexing to contiguous ids is required for a correct save/reopen round-trip: the KDBX
     /// binary pool is reloaded positionally, so gaps in the id range would otherwise misalign
     /// references. [`Database::save`] already serializes an equivalent compacted view, so deleted
     /// binaries are never written back even if this is not called; use this to also drop them from
     /// the in-memory pool (e.g. to reflect the change in [`Database::num_attachments`]).
+    ///
+    /// Any `name -> AttachmentId` reference whose target binary is absent from the pool is also
+    /// dropped from the entry/history map as part of the re-index.
     pub fn compact_attachments(&mut self) {
         // Rewrite an entry version's `name -> AttachmentId` map through `remap`, dropping any
         // reference whose target is not retained.
@@ -359,7 +346,6 @@ impl Database {
             }
         }
 
-        let referenced = self.attachment_references();
         let remap = self.attachment_compaction_remap();
 
         // Rewrite every live and history attachment reference through the mapping.
@@ -372,17 +358,11 @@ impl Database {
             }
         }
 
-        // Rebuild the pool with the new contiguous ids, dropping orphans. The cached back-reference
-        // set stores only live (`None`) references; historical referrers are derived on demand (see
-        // `attachment_referrers`) so that no stale positional history index is ever persisted.
+        // Rebuild the pool with the new contiguous ids, dropping orphans.
         let mut old_pool = std::mem::take(&mut self.attachments);
         for (&old_id, &new_id) in &remap {
             if let Some(mut attachment) = old_pool.remove(&old_id) {
                 attachment.id = new_id;
-                attachment.entries = referenced
-                    .get(&old_id)
-                    .map(|refs| refs.iter().copied().filter(|(_, hist)| hist.is_none()).collect())
-                    .unwrap_or_default();
                 self.attachments.insert(new_id, attachment);
             }
         }

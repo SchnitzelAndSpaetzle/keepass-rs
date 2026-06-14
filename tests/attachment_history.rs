@@ -351,10 +351,9 @@ fn save_keeps_history_attachment_without_manual_compaction() {
     );
 }
 
-/// Removing an entry that, after reopen, references a binary only through a history version must not
-/// leave a dangling back-reference. Reconstructed back-references include `(entry_id, Some(i))`, so a
-/// naive removal that only visits the live version would orphan that back-reference and make
-/// `AttachmentRef::entries(true)` panic when it dereferences the now-missing entry.
+/// Removing an entry that, after reopen, references a binary only through a history version must free
+/// that binary (no surviving entry references it) and leave no dangling reference for
+/// `AttachmentRef::entries(true)` to trip over.
 #[test]
 fn removing_entry_clears_history_only_attachment_refs() {
     let combo = combo();

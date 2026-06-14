@@ -1,10 +1,7 @@
-use std::{
-    collections::HashSet,
-    ops::{Deref, DerefMut},
-};
+use std::ops::{Deref, DerefMut};
 
 use crate::{
-    db::{EntryId, EntryMut, EntryRef, Value},
+    db::{EntryMut, EntryRef, Value},
     Database,
 };
 
@@ -46,10 +43,6 @@ impl std::fmt::Display for AttachmentId {
 #[cfg_attr(feature = "serialization", derive(serde::Serialize))]
 pub struct Attachment {
     pub(crate) id: AttachmentId,
-
-    /// The entries that reference this attachment, along with the history index of the entry
-    /// version that references it (if applicable).
-    pub(crate) entries: HashSet<(EntryId, Option<usize>)>,
 
     /// The binary data of the attachment.
     pub data: Value<Vec<u8>>,

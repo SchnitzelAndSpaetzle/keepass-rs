@@ -434,11 +434,7 @@ impl EntryMut<'_> {
     pub fn add_attachment(&mut self, name: impl Into<String>, data: Value<Vec<u8>>) -> AttachmentMut<'_> {
         let id = AttachmentId::next_free(self.database);
 
-        let entries: HashSet<(EntryId, Option<usize>)> = vec![(self.id, None)].into_iter().collect();
-
-        self.database
-            .attachments
-            .insert(id, Attachment { id, entries, data });
+        self.database.attachments.insert(id, Attachment { id, data });
 
         if let Some(old_id) = self.attachments.insert(name.into(), id) {
             // if there was an old attachment with this name, remove it
@@ -448,62 +444,27 @@ impl EntryMut<'_> {
         AttachmentMut::new(self.database, id)
     }
 
-    /// Remove an attachment by name from this entry.
+    /// Remove an attachment by name from this entry version.
     ///
-    /// This removes only the reference held by this exact entry version (live or a specific history
-    /// index); references from other versions are left intact, mirroring [`Self::set_icon_none`].
-    /// The binary is not garbage-collected from the in-memory pool here: an attachment still
-    /// referenced by a history version must survive, and freed ids must not be reused while any
-    /// version still points at them. [`Database::save`][crate::db::Database::save] already writes a
-    /// compacted view, so a binary referenced by no live or history version is not persisted; call
+    /// This drops only this exact entry version's `name -> AttachmentId` reference; references from
+    /// other versions (including history) are left intact. The binary is not garbage-collected from
+    /// the in-memory pool here: an attachment still referenced by a history version must survive, and
+    /// freed ids must not be reused while any version still points at them.
+    /// [`Database::save`][crate::db::Database::save] already writes a compacted view, so a binary
+    /// referenced by no live or history version is not persisted; call
     /// [`Database::compact_attachments`][crate::db::Database::compact_attachments] to also drop it
     /// from the in-memory pool.
     pub fn remove_attachment_by_name(&mut self, name: &str) {
-        let id = self.id;
-        let history_index = self.history_index;
-
-        // remove the attachment reference from this entry version
-        if let Some(attachment_id) = self.attachments.remove(name) {
-            // keep this version's back-reference if another name in the same version still points at
-            // the same binary (a parsed file may reference one binary under several names).
-            let still_referenced_here = self.attachments.values().any(|&other| other == attachment_id);
-
-            if !still_referenced_here {
-                if let Some(mut attachment) = self.database.attachment_mut(attachment_id) {
-                    attachment.entries.retain(|&(entry_id, entry_history_index)| {
-                        !(entry_id == id && entry_history_index == history_index)
-                    });
-                }
-            }
-        }
+        self.attachments.remove(name);
     }
 
-    /// Remove an attachment by id from this entry.
+    /// Remove an attachment by id from this entry version.
     ///
-    /// This removes only the reference held by this exact entry version (live or a specific history
-    /// index); see [`Self::remove_attachment_by_name`] for the retention and garbage-collection
+    /// Drops every `name -> AttachmentId` reference for `attachment_id` held by this exact entry
+    /// version; see [`Self::remove_attachment_by_name`] for the retention and garbage-collection
     /// semantics.
     pub fn remove_attachment_by_id(&mut self, attachment_id: AttachmentId) {
-        let id = self.id;
-        let history_index = self.history_index;
-
-        // remove the attachment reference from this entry version
-        let mut names_to_remove = Vec::new();
-        for (name, &att_id) in &self.attachments {
-            if att_id == attachment_id {
-                names_to_remove.push(name.clone());
-            }
-        }
-
-        for name in names_to_remove {
-            self.attachments.remove(&name);
-        }
-
-        if let Some(mut attachment) = self.database.attachment_mut(attachment_id) {
-            attachment.entries.retain(|&(entry_id, entry_history_index)| {
-                !(entry_id == id && entry_history_index == history_index)
-            });
-        }
+        self.attachments.retain(|_, &mut id| id != attachment_id);
     }
 
     /// Remove the icon from this entry, if it exists.
@@ -631,18 +592,13 @@ impl EntryMut<'_> {
 
         // Collect the attachments this entry references in its live version or any history version,
         // then garbage-collect those that no surviving entry references. Referencing versions are
-        // derived from the forward `name -> AttachmentId` maps (the cached back-reference set is not
-        // authoritative), so removing an entry cannot leave a dangling reference.
+        // derived from the forward `name -> AttachmentId` maps, so removing an entry cannot leave a
+        // dangling reference.
         let mut attachment_ids: HashSet<AttachmentId> = self.attachments.values().copied().collect();
         if let Some(history) = self.history.as_ref() {
             for hist_entry in &history.entries {
                 attachment_ids.extend(hist_entry.attachments.values().copied());
             }
-        }
-
-        // Drop this entry's live back-references from the (best-effort, live-only) cache.
-        for attachment in self.database.attachments.values_mut() {
-            attachment.entries.retain(|&(entry_id, _)| entry_id != id);
         }
 
         for attachment_id in attachment_ids {
