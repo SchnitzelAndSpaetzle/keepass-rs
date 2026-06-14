@@ -452,10 +452,12 @@ impl EntryMut<'_> {
     ///
     /// This removes only the reference held by this exact entry version (live or a specific history
     /// index); references from other versions are left intact, mirroring [`Self::set_icon_none`].
-    /// The binary is not garbage-collected here: an attachment still referenced by a history version
-    /// must survive, and freed ids must not be reused while any version still points at them. Use
-    /// [`Database::compact_attachments`][crate::db::Database::compact_attachments] to prune binaries
-    /// that no live or history version references.
+    /// The binary is not garbage-collected from the in-memory pool here: an attachment still
+    /// referenced by a history version must survive, and freed ids must not be reused while any
+    /// version still points at them. [`Database::save`][crate::db::Database::save] already writes a
+    /// compacted view, so a binary referenced by no live or history version is not persisted; call
+    /// [`Database::compact_attachments`][crate::db::Database::compact_attachments] to also drop it
+    /// from the in-memory pool.
     pub fn remove_attachment_by_name(&mut self, name: &str) {
         let id = self.id;
         let history_index = self.history_index;

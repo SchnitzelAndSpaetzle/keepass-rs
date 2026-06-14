@@ -282,6 +282,75 @@ fn existing_live_attachment_unchanged() {
     );
 }
 
+/// A plain `Database::save` (without a manual `compact_attachments`) must not write back the bytes
+/// of an attachment whose last live/history reference was removed.
+#[test]
+fn save_drops_deleted_attachment_without_manual_compaction() {
+    let combo = combo();
+    let mut db = Database::with_config(combo.get_config());
+
+    {
+        let mut root = db.root_mut();
+        let mut e = root.add_entry_with_id(ENTRY_ID).unwrap();
+        e.add_attachment("secret.bin", Value::Unprotected(b"top-secret".to_vec()));
+    }
+
+    // Delete the only reference, then save WITHOUT calling compact_attachments first.
+    db.entry_mut(ENTRY_ID)
+        .unwrap()
+        .remove_attachment_by_name("secret.bin");
+    assert_eq!(db.num_attachments(), 1, "deferred GC keeps the binary in memory");
+
+    let bytes = save_to_vec(&db, combo.get_key());
+    let parsed = Database::open(&mut bytes.as_slice(), combo.get_key()).expect("reopen");
+
+    assert_eq!(
+        parsed.num_attachments(),
+        0,
+        "deleted attachment bytes must not be written back by a plain save"
+    );
+    assert!(parsed
+        .entry(ENTRY_ID)
+        .unwrap()
+        .attachment_by_name("secret.bin")
+        .is_none());
+
+    // The caller's in-memory database is untouched by the save (non-mutating compaction).
+    assert_eq!(db.num_attachments(), 1, "save must not mutate the caller's pool");
+}
+
+/// A history-referenced attachment must still be written by a plain save even though a higher-id
+/// sibling was deleted (compacted view must not drop or misalign it).
+#[test]
+fn save_keeps_history_attachment_without_manual_compaction() {
+    let combo = combo();
+    let mut db = build_entry_with_history(&combo);
+
+    db.entry_mut(ENTRY_ID).unwrap().remove_attachment_by_name("A.bin");
+
+    // No compact_attachments() call here.
+    let bytes = save_to_vec(&db, combo.get_key());
+    let parsed = Database::open(&mut bytes.as_slice(), combo.get_key()).expect("reopen");
+
+    assert_eq!(parsed.num_attachments(), 1);
+    let e = parsed.entry(ENTRY_ID).unwrap();
+    assert!(
+        e.attachment_by_name("A.bin").is_none(),
+        "live no longer references A.bin"
+    );
+    assert_eq!(
+        e.historical(0)
+            .unwrap()
+            .attachment_by_name("A.bin")
+            .unwrap()
+            .data
+            .get()
+            .as_slice(),
+        b"AAA",
+        "history attachment must survive a plain save"
+    );
+}
+
 /// Removing an entry that, after reopen, references a binary only through a history version must not
 /// leave a dangling back-reference. Reconstructed back-references include `(entry_id, Some(i))`, so a
 /// naive removal that only visits the live version would orphan that back-reference and make
