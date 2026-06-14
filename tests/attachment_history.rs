@@ -281,3 +281,38 @@ fn existing_live_attachment_unchanged() {
         b"hello",
     );
 }
+
+/// Removing an entry that, after reopen, references a binary only through a history version must not
+/// leave a dangling back-reference. Reconstructed back-references include `(entry_id, Some(i))`, so a
+/// naive removal that only visits the live version would orphan that back-reference and make
+/// `AttachmentRef::entries(true)` panic when it dereferences the now-missing entry.
+#[test]
+fn removing_entry_clears_history_only_attachment_refs() {
+    let combo = combo();
+    let mut db = build_entry_with_history(&combo);
+
+    // Make A.bin history-only, then round-trip so the back-reference set is rebuilt on load.
+    db.entry_mut(ENTRY_ID).unwrap().remove_attachment_by_name("A.bin");
+    db.compact_attachments();
+    let bytes = save_to_vec(&db, combo.get_key());
+    let mut db = Database::open(&mut bytes.as_slice(), combo.get_key()).expect("reopen");
+    assert_eq!(
+        db.num_attachments(),
+        1,
+        "A.bin is retained via history before removal"
+    );
+
+    // Removing the entry must clean the history back-reference (no panic) and free the binary.
+    db.entry_mut(ENTRY_ID).unwrap().remove();
+
+    // Enumerating remaining attachments (including historical referrers) must not panic on a
+    // dangling EntryRef.
+    for attachment in db.iter_all_attachments() {
+        let _ = attachment.entries(true).count();
+    }
+    assert_eq!(
+        db.num_attachments(),
+        0,
+        "the orphaned history attachment must be freed"
+    );
+}

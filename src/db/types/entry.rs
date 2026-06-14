@@ -462,10 +462,16 @@ impl EntryMut<'_> {
 
         // remove the attachment reference from this entry version
         if let Some(attachment_id) = self.attachments.remove(name) {
-            if let Some(mut attachment) = self.database.attachment_mut(attachment_id) {
-                attachment.entries.retain(|&(entry_id, entry_history_index)| {
-                    !(entry_id == id && entry_history_index == history_index)
-                });
+            // keep this version's back-reference if another name in the same version still points at
+            // the same binary (a parsed file may reference one binary under several names).
+            let still_referenced_here = self.attachments.values().any(|&other| other == attachment_id);
+
+            if !still_referenced_here {
+                if let Some(mut attachment) = self.database.attachment_mut(attachment_id) {
+                    attachment.entries.retain(|&(entry_id, entry_history_index)| {
+                        !(entry_id == id && entry_history_index == history_index)
+                    });
+                }
             }
         }
     }
@@ -621,15 +627,31 @@ impl EntryMut<'_> {
             }
         }
 
-        // remove references to this entry from attachments
-        self.foreach_attachment_mut(|mut attachment| {
-            attachment.entries.retain(|&(entry_id, _)| entry_id != id);
-
-            // if this was the last entry referencing the attachment, remove it from the database
-            if attachment.entries.is_empty() {
-                attachment.remove();
+        // remove references to this entry from attachments, including any referenced only by a
+        // history version (foreach_attachment_mut only visits the live version, which would leave a
+        // dangling back-reference to this now-removed entry).
+        let mut attachment_ids: HashSet<AttachmentId> = self.attachments.values().copied().collect();
+        if let Some(history) = self.history.as_ref() {
+            for hist_entry in &history.entries {
+                attachment_ids.extend(hist_entry.attachments.values().copied());
             }
-        });
+        }
+        for attachment_id in attachment_ids {
+            let now_unreferenced = match self.database.attachments.get_mut(&attachment_id) {
+                Some(attachment) => {
+                    attachment.entries.retain(|&(entry_id, _)| entry_id != id);
+                    attachment.entries.is_empty()
+                }
+                None => false,
+            };
+
+            // if no live or history version references the attachment any more, remove it
+            if now_unreferenced {
+                if let Some(attachment) = self.database.attachment_mut(attachment_id) {
+                    attachment.remove();
+                }
+            }
+        }
 
         let entry = self.database.entries.remove(&self.id).expect("Entry not found");
 
