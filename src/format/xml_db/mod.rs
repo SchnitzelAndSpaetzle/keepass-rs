@@ -192,6 +192,42 @@ impl KeePassFile {
             }
         }
 
+        // Re-populate Attachment back-reference sets.
+        //
+        // As with custom icons above, the XML parser creates Attachment values with empty `entries`
+        // sets because binary data and entry data live in separate parts of the XML file. We
+        // reconstruct the back-references from the attachment references that were already set on
+        // each entry (and on each of its history versions) during xml_to_db_handle. References are
+        // collected first and applied afterwards to keep the borrow on `db.entries` disjoint from
+        // the mutable borrow on `db.attachments`.
+        let mut attachment_refs: Vec<(crate::db::AttachmentId, (crate::db::EntryId, Option<usize>))> =
+            Vec::new();
+        let entry_ids: Vec<crate::db::EntryId> = db.entries.keys().copied().collect();
+        for entry_id in entry_ids {
+            if let Some(entry) = db.entries.get(&entry_id) {
+                // current version
+                for &attachment_id in entry.attachments.values() {
+                    attachment_refs.push((attachment_id, (entry_id, None)));
+                }
+
+                // historical versions
+                let history_len = entry.history.as_ref().map_or(0, |h| h.entries.len());
+                for i in 0..history_len {
+                    #[allow(clippy::indexing_slicing)] // i is in bounds by construction
+                    if let Some(history) = entry.history.as_ref() {
+                        for &attachment_id in history.entries[i].attachments.values() {
+                            attachment_refs.push((attachment_id, (entry_id, Some(i))));
+                        }
+                    }
+                }
+            }
+        }
+        for (attachment_id, reference) in attachment_refs {
+            if let Some(attachment) = db.attachments.get_mut(&attachment_id) {
+                attachment.entries.insert(reference);
+            }
+        }
+
         let group_ids: Vec<crate::db::GroupId> = db.groups.keys().copied().collect();
         for group_id in group_ids {
             if let Some(crate::db::Icon::Custom(icon_id)) =
