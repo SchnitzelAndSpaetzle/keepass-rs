@@ -385,3 +385,106 @@ fn removing_entry_clears_history_only_attachment_refs() {
         "the orphaned history attachment must be freed"
     );
 }
+
+/// Build a database, reopened from disk, where attachment `A.bin` is referenced only by `history[0]`,
+/// then a change-tracking edit inserts a new snapshot at index 0 (shifting the real reference to
+/// `history[1]`). Returns the reopened, edited database.
+fn history_only_attachment_then_shifted(combo: &Combo) -> Database {
+    let mut db = build_entry_with_history(combo);
+    db.entry_mut(ENTRY_ID).unwrap().remove_attachment_by_name("A.bin");
+    db.compact_attachments();
+    let bytes = save_to_vec(&db, combo.get_key());
+    let mut db = Database::open(&mut bytes.as_slice(), combo.get_key()).expect("reopen");
+
+    // A change-tracked edit pushes a new snapshot (which does not reference A.bin) to index 0,
+    // shifting the snapshot that does reference A.bin from index 0 to index 1.
+    {
+        let mut e = db.entry_mut(ENTRY_ID).unwrap();
+        let mut tracked = e.track_changes();
+        tracked.set_unprotected("Title", "e1-v3");
+    }
+    db
+}
+
+/// After a history-index shift, the attachment must still resolve to the correct (shifted) history
+/// version, `entries(true)` must not be stale or panic, and a save must round-trip it.
+#[test]
+fn history_index_shift_resolves_correct_version() {
+    let combo = combo();
+    let db = history_only_attachment_then_shifted(&combo);
+
+    {
+        let e = db.entry(ENTRY_ID).unwrap();
+        assert!(
+            e.historical(0).unwrap().attachment_by_name("A.bin").is_none(),
+            "the new snapshot at index 0 does not reference A.bin"
+        );
+        assert_eq!(
+            e.historical(1)
+                .unwrap()
+                .attachment_by_name("A.bin")
+                .unwrap()
+                .data
+                .get()
+                .as_slice(),
+            b"AAA",
+            "the shifted snapshot at index 1 still references A.bin"
+        );
+    }
+
+    // The derived back-reference enumeration finds exactly the shifted version, without panicking.
+    let att_id = db
+        .entry(ENTRY_ID)
+        .unwrap()
+        .historical(1)
+        .unwrap()
+        .attachment_by_name("A.bin")
+        .unwrap()
+        .id();
+    assert_eq!(db.attachment(att_id).unwrap().entries(true).count(), 1);
+
+    // The attachment survives a plain save/reopen and still resolves under the shifted index.
+    let bytes = save_to_vec(&db, combo.get_key());
+    let parsed = Database::open(&mut bytes.as_slice(), combo.get_key()).expect("reopen");
+    assert_eq!(parsed.num_attachments(), 1);
+    assert_eq!(
+        parsed
+            .entry(ENTRY_ID)
+            .unwrap()
+            .historical(1)
+            .unwrap()
+            .attachment_by_name("A.bin")
+            .unwrap()
+            .data
+            .get()
+            .as_slice(),
+        b"AAA",
+    );
+}
+
+/// After a history-index shift, removing the attachment via `AttachmentMut::remove` must strip the
+/// reference from the real (shifted) history version, not the wrong one, and must not panic.
+#[test]
+fn remove_after_history_shift_targets_correct_version() {
+    let combo = combo();
+    let mut db = history_only_attachment_then_shifted(&combo);
+
+    let att_id = db
+        .entry(ENTRY_ID)
+        .unwrap()
+        .historical(1)
+        .unwrap()
+        .attachment_by_name("A.bin")
+        .unwrap()
+        .id();
+
+    db.attachment_mut(att_id).unwrap().remove();
+
+    let e = db.entry(ENTRY_ID).unwrap();
+    assert!(
+        e.historical(1).unwrap().attachment_by_name("A.bin").is_none(),
+        "remove must strip the reference from the actual (shifted) history version"
+    );
+    assert!(e.historical(0).unwrap().attachment_by_name("A.bin").is_none());
+    assert_eq!(db.num_attachments(), 0);
+}

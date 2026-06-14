@@ -272,6 +272,33 @@ impl Database {
         referenced
     }
 
+    /// Collect the `(EntryId, history_index)` versions that currently reference the given attachment
+    /// id, derived from the authoritative forward `name -> AttachmentId` maps (not from the cached
+    /// back-reference set, which cannot be kept accurate across history-index shifts). With
+    /// `include_historical` false, only the live versions are returned.
+    pub(crate) fn attachment_referrers(
+        &self,
+        id: AttachmentId,
+        include_historical: bool,
+    ) -> Vec<(EntryId, Option<usize>)> {
+        let mut referrers = Vec::new();
+        for (&entry_id, entry) in &self.entries {
+            if entry.attachments.values().any(|&a| a == id) {
+                referrers.push((entry_id, None));
+            }
+            if include_historical {
+                if let Some(history) = entry.history.as_ref() {
+                    for (i, hist_entry) in history.entries.iter().enumerate() {
+                        if hist_entry.attachments.values().any(|&a| a == id) {
+                            referrers.push((entry_id, Some(i)));
+                        }
+                    }
+                }
+            }
+        }
+        referrers
+    }
+
     /// Build the stable `old -> new` contiguous attachment-id remapping over ids that are still
     /// referenced and present in the pool. Unreferenced (deleted) binaries are excluded. Ordered by
     /// the underlying id for deterministic output.
@@ -345,13 +372,17 @@ impl Database {
             }
         }
 
-        // Rebuild the pool with the new contiguous ids, dropping orphans and refreshing each
-        // surviving attachment's back-reference set.
+        // Rebuild the pool with the new contiguous ids, dropping orphans. The cached back-reference
+        // set stores only live (`None`) references; historical referrers are derived on demand (see
+        // `attachment_referrers`) so that no stale positional history index is ever persisted.
         let mut old_pool = std::mem::take(&mut self.attachments);
         for (&old_id, &new_id) in &remap {
             if let Some(mut attachment) = old_pool.remove(&old_id) {
                 attachment.id = new_id;
-                attachment.entries = referenced.get(&old_id).cloned().unwrap_or_default();
+                attachment.entries = referenced
+                    .get(&old_id)
+                    .map(|refs| refs.iter().copied().filter(|(_, hist)| hist.is_none()).collect())
+                    .unwrap_or_default();
                 self.attachments.insert(new_id, attachment);
             }
         }

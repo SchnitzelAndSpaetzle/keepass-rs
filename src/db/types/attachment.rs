@@ -97,14 +97,15 @@ impl AttachmentRef<'_> {
     /// If `include_historical` is false, only returns entries that currently reference this
     /// attachment. If `include_historical` is true, also returns old versions of entries that
     /// reference this attachment, even if they have been modified to no longer reference it.
+    ///
+    /// The referencing versions are derived from each entry's `name -> AttachmentId` map, so the
+    /// result is always accurate and never points at a stale history index.
     pub fn entries(&self, include_historical: bool) -> impl Iterator<Item = EntryRef<'_>> {
-        self.entries.iter().filter_map(move |&(id, history_index)| {
-            if !include_historical && history_index.is_some() {
-                return None;
-            }
-
-            Some(EntryRef::new_historical(self.database, id, history_index))
-        })
+        let database = self.database;
+        database
+            .attachment_referrers(self.id, include_historical)
+            .into_iter()
+            .map(move |(id, history_index)| EntryRef::new_historical(database, id, history_index))
     }
 }
 
@@ -156,16 +157,15 @@ impl AttachmentMut<'_> {
     /// If `include_historical` is false, only returns entries that currently reference this
     /// attachment. If `include_historical` is true, also returns old versions of entries that
     /// reference this attachment, even if they have been modified to no longer reference it.
+    ///
+    /// The referencing versions are derived from each entry's `name -> AttachmentId` map, so the
+    /// result is always accurate and never points at a stale history index.
     pub fn foreach_entry_mut<F>(&mut self, mut f: F, include_historical: bool)
     where
         F: FnMut(EntryMut<'_>),
     {
-        let entries: Vec<(EntryId, Option<usize>)> = self.entries.iter().copied().collect();
+        let entries = self.database.attachment_referrers(self.id, include_historical);
         for (id, history_index) in entries {
-            if !include_historical && history_index.is_some() {
-                continue;
-            }
-
             f(EntryMut::new_historical(self.database, id, history_index));
         }
     }

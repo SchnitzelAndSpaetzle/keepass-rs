@@ -629,29 +629,35 @@ impl EntryMut<'_> {
             }
         }
 
-        // remove references to this entry from attachments, including any referenced only by a
-        // history version (foreach_attachment_mut only visits the live version, which would leave a
-        // dangling back-reference to this now-removed entry).
+        // Collect the attachments this entry references in its live version or any history version,
+        // then garbage-collect those that no surviving entry references. Referencing versions are
+        // derived from the forward `name -> AttachmentId` maps (the cached back-reference set is not
+        // authoritative), so removing an entry cannot leave a dangling reference.
         let mut attachment_ids: HashSet<AttachmentId> = self.attachments.values().copied().collect();
         if let Some(history) = self.history.as_ref() {
             for hist_entry in &history.entries {
                 attachment_ids.extend(hist_entry.attachments.values().copied());
             }
         }
-        for attachment_id in attachment_ids {
-            let now_unreferenced = match self.database.attachments.get_mut(&attachment_id) {
-                Some(attachment) => {
-                    attachment.entries.retain(|&(entry_id, _)| entry_id != id);
-                    attachment.entries.is_empty()
-                }
-                None => false,
-            };
 
-            // if no live or history version references the attachment any more, remove it
-            if now_unreferenced {
-                if let Some(attachment) = self.database.attachment_mut(attachment_id) {
-                    attachment.remove();
-                }
+        // Drop this entry's live back-references from the (best-effort, live-only) cache.
+        for attachment in self.database.attachments.values_mut() {
+            attachment.entries.retain(|&(entry_id, _)| entry_id != id);
+        }
+
+        for attachment_id in attachment_ids {
+            let referenced_elsewhere = self.database.entries.iter().any(|(&other_id, other)| {
+                other_id != id
+                    && (other.attachments.values().any(|&a| a == attachment_id)
+                        || other.history.as_ref().is_some_and(|h| {
+                            h.entries
+                                .iter()
+                                .any(|he| he.attachments.values().any(|&a| a == attachment_id))
+                        }))
+            });
+
+            if !referenced_elsewhere {
+                self.database.attachments.remove(&attachment_id);
             }
         }
 
