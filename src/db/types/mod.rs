@@ -334,6 +334,7 @@ impl Database {
     /// Whether the attachment pool would change under compaction, i.e. it contains binaries that no
     /// live or history version references (deleted bytes that would otherwise be written back out) or
     /// its ids are not a contiguous `0..n` range. Used by the save path to compact only when needed.
+    #[cfg(feature = "save_kdbx4")] // only used by the save path (`to_xml`), which is gated the same way
     pub(crate) fn attachments_need_compaction(&self) -> bool {
         let remap = self.attachment_compaction_remap();
         remap.len() != self.attachments.len() || remap.iter().any(|(old, new)| old != new)
