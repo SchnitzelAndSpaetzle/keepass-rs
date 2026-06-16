@@ -16,7 +16,7 @@ pub mod timestamp;
 use serde::{Deserialize, Serialize, Serializer};
 
 use base64::{engine::general_purpose as base64_engine, Engine as _};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -59,6 +59,21 @@ pub fn to_xml(
     db: &crate::db::Database,
     inner_encryptor: &mut dyn Cipher,
 ) -> Result<(Vec<u8>, Vec<crate::db::Value<Vec<u8>>>), DatabaseSaveError> {
+    // Serialize a compacted view of the attachment pool: prune binaries referenced by no live or
+    // history entry (so deleted attachment bytes are never written back) and re-index the survivors
+    // to contiguous ids (so the positional reload of the KDBX binary pool stays aligned). This is
+    // done on a clone so the caller's database is not mutated by a save, and only when the pool
+    // actually needs it, to avoid cloning on the common no-deletion path.
+    let compacted;
+    let db = if db.attachments_need_compaction() {
+        let mut clone = db.clone();
+        clone.compact_attachments();
+        compacted = clone;
+        &compacted
+    } else {
+        db
+    };
+
     let kdbx = KeePassFile::db_to_xml(db, inner_encryptor)?;
     let xml = quick_xml::se::to_string_with_root("KeePassFile", &kdbx)?
         .as_bytes()
@@ -99,7 +114,6 @@ impl KeePassFile {
         for (i, header_attachment) in header_attachments.iter().enumerate() {
             let attachment = crate::db::Attachment {
                 id: crate::db::AttachmentId::new(i),
-                entries: HashSet::new(),
                 data: header_attachment.clone(),
             };
             attachments.insert(attachment.id, attachment);
@@ -111,14 +125,7 @@ impl KeePassFile {
                 let id = crate::db::AttachmentId::next_free(&db);
                 let data = binary.xml_to_db(inner_decryptor)?;
 
-                attachments.insert(
-                    id,
-                    crate::db::Attachment {
-                        id,
-                        entries: HashSet::new(),
-                        data,
-                    },
-                );
+                attachments.insert(id, crate::db::Attachment { id, data });
             }
         }
 
@@ -191,6 +198,10 @@ impl KeePassFile {
                 }
             }
         }
+
+        // Attachments need no back-reference reconstruction: the entries that reference an attachment
+        // are derived on demand from the forward `name -> AttachmentId` maps (see
+        // `Database::attachment_referrers`), which is always accurate and never stale.
 
         let group_ids: Vec<crate::db::GroupId> = db.groups.keys().copied().collect();
         for group_id in group_ids {
