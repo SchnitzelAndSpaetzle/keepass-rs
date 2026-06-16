@@ -523,7 +523,6 @@ impl GroupMut<'_> {
             custom_icon_id,
             CustomIcon {
                 id: custom_icon_id,
-                entries: HashSet::new(),
                 groups: vec![id].into_iter().collect(),
                 name: None,
                 last_modification_time: Some(Times::now()),

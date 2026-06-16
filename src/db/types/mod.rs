@@ -285,6 +285,34 @@ impl Database {
         referrers
     }
 
+    /// Collect the `(EntryId, history_index)` versions that currently reference the given custom icon
+    /// id, derived from each entry's authoritative forward `icon` field across its live and history
+    /// versions (not from a cached back-reference set, which cannot be kept accurate across the
+    /// history-index shifts performed by [`History::add_entry`]). With `include_historical` false,
+    /// only the live versions are returned. Groups are not included; use the icon's `groups` set.
+    pub(crate) fn custom_icon_referrers(
+        &self,
+        id: CustomIconId,
+        include_historical: bool,
+    ) -> Vec<(EntryId, Option<usize>)> {
+        let mut referrers = Vec::new();
+        for (&entry_id, entry) in &self.entries {
+            if entry.icon == Some(Icon::Custom(id)) {
+                referrers.push((entry_id, None));
+            }
+            if include_historical {
+                if let Some(history) = entry.history.as_ref() {
+                    for (i, hist_entry) in history.entries.iter().enumerate() {
+                        if hist_entry.icon == Some(Icon::Custom(id)) {
+                            referrers.push((entry_id, Some(i)));
+                        }
+                    }
+                }
+            }
+        }
+        referrers
+    }
+
     /// Build the stable `old -> new` contiguous attachment-id remapping over ids that are still
     /// referenced and present in the pool. Unreferenced (deleted) binaries are excluded. Ordered by
     /// the underlying id for deterministic output.
@@ -306,6 +334,7 @@ impl Database {
     /// Whether the attachment pool would change under compaction, i.e. it contains binaries that no
     /// live or history version references (deleted bytes that would otherwise be written back out) or
     /// its ids are not a contiguous `0..n` range. Used by the save path to compact only when needed.
+    #[cfg(feature = "save_kdbx4")] // only used by the save path (`to_xml`), which is gated the same way
     pub(crate) fn attachments_need_compaction(&self) -> bool {
         let remap = self.attachment_compaction_remap();
         remap.len() != self.attachments.len() || remap.iter().any(|(old, new)| old != new)

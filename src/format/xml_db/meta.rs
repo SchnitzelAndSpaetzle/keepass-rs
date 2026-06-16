@@ -481,7 +481,6 @@ impl From<Icon> for crate::db::CustomIcon {
     fn from(icon: Icon) -> Self {
         crate::db::CustomIcon {
             id: crate::db::CustomIconId::from_uuid(icon.uuid.0),
-            entries: HashSet::new(),
             groups: HashSet::new(),
             name: icon.name.clone(),
             last_modification_time: icon.last_modification_time.map(|t| t.into()),
