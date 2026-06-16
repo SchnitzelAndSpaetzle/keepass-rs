@@ -8,7 +8,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    db::{EntryId, EntryMut, EntryRef, GroupId, GroupMut, GroupRef},
+    db::{EntryMut, EntryRef, GroupId, GroupMut, GroupRef},
     Database,
 };
 
@@ -55,7 +55,6 @@ impl CustomIconId {
 pub struct CustomIcon {
     pub(crate) id: CustomIconId,
 
-    pub(crate) entries: HashSet<(EntryId, Option<usize>)>,
     pub(crate) groups: HashSet<GroupId>,
 
     /// Filename for the icon
@@ -110,14 +109,15 @@ impl CustomIconRef<'_> {
     /// If `include_historical` is false, only returns entries that currently reference this
     /// icon. If `include_historical` is true, also returns old versions of entries that
     /// reference this icon, even if they have been modified to no longer reference it.
+    ///
+    /// The referencing versions are derived from each entry's `icon` field, so the result is always
+    /// accurate and never points at a stale history index.
     pub fn entries(&self, include_historical: bool) -> impl Iterator<Item = EntryRef<'_>> {
-        self.entries.iter().filter_map(move |&(id, history_index)| {
-            if !include_historical && history_index.is_some() {
-                return None;
-            }
-
-            Some(EntryRef::new_historical(self.database, id, history_index))
-        })
+        let database = self.database;
+        database
+            .custom_icon_referrers(self.id, include_historical)
+            .into_iter()
+            .map(move |(id, history_index)| EntryRef::new_historical(database, id, history_index))
     }
 
     /// Get an iterator over the groups that reference this custom icon.
@@ -177,16 +177,15 @@ impl CustomIconMut<'_> {
     /// only applies the closure to entries that currently reference this icon.
     /// If `include_historical` is true, also applies the closure to old versions of entries that
     /// reference this icon, even if they have been modified to no longer reference it.
+    ///
+    /// The referencing versions are derived from each entry's `icon` field, so the result is always
+    /// accurate and never points at a stale history index.
     pub fn foreach_entry_mut<F>(&mut self, mut f: F, include_historical: bool)
     where
         F: FnMut(EntryMut<'_>),
     {
-        let entries: Vec<(EntryId, Option<usize>)> = self.entries.iter().copied().collect();
+        let entries = self.database.custom_icon_referrers(self.id, include_historical);
         for (id, history_index) in entries {
-            if !include_historical && history_index.is_some() {
-                continue;
-            }
-
             f(EntryMut::new_historical(self.database, id, history_index));
         }
     }

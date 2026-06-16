@@ -336,19 +336,6 @@ impl EntryMut<'_> {
         }
     }
 
-    /// Gets an [EntryMut] to a historical version of the [Entry], if it exists
-    pub(crate) fn historical(&mut self, index: usize) -> Option<EntryMut<'_>> {
-        if index < self.history.as_ref()?.entries.len() {
-            Some(EntryMut {
-                database: self.database,
-                id: self.id,
-                history_index: Some(index),
-            })
-        } else {
-            None
-        }
-    }
-
     /// Get an immutable reference to the entry.
     pub fn as_ref(&self) -> EntryRef<'_> {
         EntryRef {
@@ -468,19 +455,12 @@ impl EntryMut<'_> {
     }
 
     /// Remove the icon from this entry, if it exists.
+    ///
+    /// This clears only this exact entry version's `icon` field; other versions (including history)
+    /// keep their own icon. Custom-icon referrers are derived from the `icon` field on demand (see
+    /// [`Database::custom_icon_referrers`][crate::db::Database]), so no back-reference bookkeeping is
+    /// needed here.
     pub fn set_icon_none(&mut self) {
-        let id = self.id;
-        let history_index = self.history_index;
-
-        if let Some(Icon::Custom(custom_icon_id)) = self.icon {
-            // if this entry had a custom icon, remove this entry from the icon's reference list
-            if let Some(mut custom_icon) = self.database.custom_icon_mut(custom_icon_id) {
-                custom_icon.entries.retain(|&(entry_id, entry_history_index)| {
-                    !(entry_id == id && entry_history_index == history_index)
-                });
-            }
-        }
-
         self.icon = None;
     }
 
@@ -494,15 +474,9 @@ impl EntryMut<'_> {
     pub fn set_icon_custom(&mut self, custom_icon_id: CustomIconId) -> Result<(), CustomIconNotFoundError> {
         self.set_icon_none();
 
-        let id = self.id;
-        let history_index = self.history_index;
-
-        let mut custom_icon = self
-            .database
-            .custom_icon_mut(custom_icon_id)
-            .ok_or(CustomIconNotFoundError(custom_icon_id))?;
-
-        custom_icon.entries.insert((id, history_index));
+        if !self.database.custom_icons.contains_key(&custom_icon_id) {
+            return Err(CustomIconNotFoundError(custom_icon_id));
+        }
 
         self.icon = Some(Icon::Custom(custom_icon_id));
 
@@ -516,14 +490,10 @@ impl EntryMut<'_> {
 
         let custom_icon_id = CustomIconId::new();
 
-        let id = self.id;
-        let history_index = self.history_index;
-
         self.database.custom_icons.insert(
             custom_icon_id,
             CustomIcon {
                 id: custom_icon_id,
-                entries: vec![(id, history_index)].into_iter().collect(),
                 groups: HashSet::new(),
                 name: None,
                 last_modification_time: Some(Times::now()),
@@ -576,19 +546,12 @@ impl EntryMut<'_> {
 
     /// Remove this entry from the database, including all its attachments.
     #[allow(clippy::expect_used, clippy::missing_panics_doc)] // the entry and parent should always be found
-    pub fn remove(mut self) {
+    pub fn remove(self) {
         let id = self.id;
 
-        // remove this entry's back-reference from its custom icon (if any)
-        self.set_icon_none();
-
-        // also remove back-references for any historical versions that have a custom icon
-        let history_len = self.history.as_ref().map_or(0, |h| h.entries.len());
-        for i in 0..history_len {
-            if let Some(mut hist_entry) = self.historical(i) {
-                hist_entry.set_icon_none();
-            }
-        }
+        // Custom-icon back-references need no cleanup here: referrers are derived on demand from each
+        // entry's `icon` field (see `Database::custom_icon_referrers`), and this entry is removed from
+        // `database.entries` below, so it can no longer appear as a referrer.
 
         // Collect the attachments this entry references in its live version or any history version,
         // then garbage-collect those that no surviving entry references. Referencing versions are
@@ -780,14 +743,10 @@ impl EntryTrack<'_> {
 
         let custom_icon_id = CustomIconId::new();
 
-        let id = self.id;
-        let history_index = self.as_mut().history_index;
-
         self.database.custom_icons.insert(
             custom_icon_id,
             CustomIcon {
                 id: custom_icon_id,
-                entries: vec![(id, history_index)].into_iter().collect(),
                 groups: HashSet::new(),
                 name: None,
                 last_modification_time: Some(Times::now()),

@@ -165,44 +165,17 @@ impl KeePassFile {
         db.attachments = attachments;
         db.custom_icons = custom_icons;
 
-        // Re-populate CustomIcon back-reference sets.
+        // Re-populate the CustomIcon group back-reference sets.
         //
-        // The XML parser creates CustomIcon values with empty `entries` and `groups` sets
-        // because icon data and entry/group data live in separate parts of the XML file.
-        // We perform a single pass here to reconstruct all back-references from the icon
-        // fields that were already set on each entry and group during xml_to_db_handle.
-        let entry_ids: Vec<crate::db::EntryId> = db.entries.keys().copied().collect();
-        for entry_id in entry_ids {
-            // current version
-            if let Some(crate::db::Icon::Custom(icon_id)) =
-                db.entries.get(&entry_id).and_then(|e| e.icon.as_ref())
-            {
-                if let Some(icon) = db.custom_icons.get_mut(icon_id) {
-                    icon.entries.insert((entry_id, None));
-                }
-            }
-
-            // historical versions
-            if let Some(entry) = db.entries.get(&entry_id) {
-                let history_len = entry.history.as_ref().map_or(0, |h| h.entries.len());
-
-                for i in 0..history_len {
-                    #[allow(clippy::indexing_slicing)] // We just checked that the index is in bounds
-                    if let Some(crate::db::Icon::Custom(icon_id)) =
-                        entry.history.as_ref().and_then(|h| h.entries[i].icon.as_ref())
-                    {
-                        if let Some(icon) = db.custom_icons.get_mut(icon_id) {
-                            icon.entries.insert((entry_id, Some(i)));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Attachments need no back-reference reconstruction: the entries that reference an attachment
-        // are derived on demand from the forward `name -> AttachmentId` maps (see
-        // `Database::attachment_referrers`), which is always accurate and never stale.
-
+        // The XML parser creates CustomIcon values with empty `groups` sets because icon data and
+        // group data live in separate parts of the XML file. We reconstruct the group references from
+        // the icon fields that were already set on each group during xml_to_db_handle.
+        //
+        // No entry back-reference reconstruction is needed: the entries (live or historical) that
+        // reference a custom icon are derived on demand from each entry's forward `icon` field (see
+        // `Database::custom_icon_referrers`), which is always accurate and never points at a stale
+        // positional history index. Attachments are handled the same way via
+        // `Database::attachment_referrers`.
         let group_ids: Vec<crate::db::GroupId> = db.groups.keys().copied().collect();
         for group_id in group_ids {
             if let Some(crate::db::Icon::Custom(icon_id)) =
