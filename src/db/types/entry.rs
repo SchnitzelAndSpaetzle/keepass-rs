@@ -174,6 +174,94 @@ impl Entry {
     pub fn get_url(&self) -> Option<&str> {
         self.get(fields::URL)
     }
+
+    /// Rewrites this entry's attachment references — including those of its
+    /// history versions — to point into `dest`'s pool, importing the
+    /// referenced bytes from `source`'s pool. References whose bytes are
+    /// missing from `source` are dropped. Blobs already present in `dest`
+    /// with equal data are reused rather than duplicated.
+    ///
+    /// Use this when transplanting an [Entry] value from one [Database] into
+    /// another (e.g. during a merge): [AttachmentId]s are only meaningful
+    /// within the pool of the database that minted them.
+    ///
+    /// Reuse is content-addressed, so two references with identical bytes —
+    /// whether across entries or on this same entry — converge on a single
+    /// destination [AttachmentId]; in-place edits through `AttachmentMut` then
+    /// affect all of them (see `Database::intern_attachment`).
+    pub fn remap_attachments(&mut self, source: &Database, dest: &mut Database) {
+        remap_attachment_map(&mut self.attachments, source, dest);
+        if let Some(history) = self.history.as_mut() {
+            for version in history.entries.iter_mut() {
+                remap_attachment_map(&mut version.attachments, source, dest);
+            }
+        }
+    }
+
+    /// Whether two entries carry the same content, ignoring timestamps,
+    /// history, and attachment pool ids. Attachments compare by name and
+    /// bytes, resolved against each entry's own database — so two copies of
+    /// an entry whose pools assigned different [AttachmentId]s to the same
+    /// data still count as equivalent.
+    pub fn content_equivalent(&self, self_db: &Database, other: &Entry, other_db: &Database) -> bool {
+        let mut a = self.clone();
+        a.times = Times::default();
+        a.history = None;
+        a.attachments = HashMap::new();
+
+        let mut b = other.clone();
+        b.times = Times::default();
+        b.history = None;
+        b.attachments = HashMap::new();
+
+        if a != b {
+            return false;
+        }
+
+        if self.attachments.len() != other.attachments.len() {
+            return false;
+        }
+        self.attachments.iter().all(|(name, self_id)| {
+            let Some(other_id) = other.attachments.get(name) else {
+                return false;
+            };
+            let self_data = self_db
+                .attachments
+                .get(self_id)
+                .map(|attachment| &attachment.data);
+            let other_data = other_db
+                .attachments
+                .get(other_id)
+                .map(|attachment| &attachment.data);
+            match (self_data, other_data) {
+                (Some(a), Some(b)) => a == b,
+                // Only two equally-dangling references count as equal.
+                (None, None) => true,
+                _ => false,
+            }
+        })
+    }
+}
+
+/// Rewrites a `name -> AttachmentId` map from `source`'s pool into `dest`'s,
+/// importing bytes as needed. Names are visited in sorted order so id
+/// assignment in `dest` is deterministic.
+fn remap_attachment_map(map: &mut HashMap<String, AttachmentId>, source: &Database, dest: &mut Database) {
+    let mut names: Vec<String> = map.keys().cloned().collect();
+    names.sort_unstable();
+    for name in names {
+        #[allow(clippy::unwrap_used)] // name was collected from the map's own keys
+        let source_id = *map.get(&name).unwrap();
+        match source.attachments.get(&source_id) {
+            Some(attachment) => {
+                let dest_id = dest.intern_attachment(&attachment.data);
+                map.insert(name, dest_id);
+            }
+            None => {
+                map.remove(&name);
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for EntryId {
