@@ -341,6 +341,41 @@ impl Database {
         remap.len() != self.attachments.len() || remap.iter().any(|(old, new)| old != new)
     }
 
+    /// Returns the id of a pool attachment whose data equals `data`, inserting `data` as a new
+    /// attachment if no equal blob exists. When several pool blobs carry equal data the smallest
+    /// id wins, so the result is deterministic.
+    ///
+    /// Attachments are **content-addressed**: byte-identical data is stored once and shared by a
+    /// single [`AttachmentId`], mirroring the KDBX binary pool (which dedups identical payloads on
+    /// save). A consequence is that mutating an interned blob in place through
+    /// [`AttachmentMut`][crate::db::AttachmentMut] affects *every* reference that shares those
+    /// bytes — so two distinct attachments with identical bytes become genuinely aliased after a
+    /// merge/remap. Callers that need to diverge one independently should re-add it under its name
+    /// with the new bytes. (A copy-on-write `AttachmentMut` would remove this footgun; left as
+    /// future work.)
+    pub(crate) fn intern_attachment(&mut self, data: &Value<Vec<u8>>) -> AttachmentId {
+        let mut equal_ids: Vec<AttachmentId> = self
+            .attachments
+            .values()
+            .filter(|attachment| &attachment.data == data)
+            .map(Attachment::id)
+            .collect();
+        equal_ids.sort_by_key(AttachmentId::id);
+        if let Some(&id) = equal_ids.first() {
+            return id;
+        }
+
+        let id = AttachmentId::next_free(self);
+        self.attachments.insert(
+            id,
+            Attachment {
+                id,
+                data: data.clone(),
+            },
+        );
+        id
+    }
+
     /// Compact the attachment binary pool in place (KeePassXC-style).
     ///
     /// Attachment deletion ([`EntryMut::remove_attachment_by_name`][crate::db::EntryMut::remove_attachment_by_name])

@@ -415,6 +415,12 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
 
         let parent_id = source_entry.parent().id();
 
+        // Clone the source entry and rewrite its attachment references —
+        // they point into the *source* pool and would otherwise dangle or
+        // collide with unrelated destination blobs.
+        let mut cloned = source_entry.deref().clone();
+        cloned.remap_attachments(source_db, dest_db);
+
         let Some(mut parent) = dest_db.group_mut(parent_id) else {
             log.warnings.push(format!(
                 "Cannot add entry {} because its parent group {} does not exist in the destination database.",
@@ -428,7 +434,7 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
             .add_entry_with_id(id)
             .expect("entry to be (re-)added should not exist yet");
 
-        *entry = source_entry.deref().clone();
+        *entry = cloned;
 
         log.events.push(MergeEvent {
             target: MergeEventTarget::Entry(id),
@@ -468,45 +474,55 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
     // Handle entries that exist in both source and destination.
     for &id in dest_entries.intersection(&source_entries) {
         #[allow(clippy::unwrap_used)] // id is guaranteed to exist in both dest and source
-        let mut dest_entry = dest_db.entry_mut(id).unwrap();
-
-        #[allow(clippy::unwrap_used)] // id is guaranteed to exist in both dest and source
         let source_entry = source_db.entry(id).unwrap();
-
-        let dest_parent_id = dest_entry.as_ref().parent().id();
         let source_parent_id = source_entry.parent().id();
 
-        // has the entry moved?
-        if dest_parent_id != source_parent_id {
-            // which move is more recent?
-            let source_location_changed = source_entry.times.location_changed;
-            let dest_location_changed = dest_entry.times.location_changed;
-            if let (Some(slc), Some(dlc)) = (source_location_changed, dest_location_changed) {
-                if slc > dlc {
-                    // the source entry has been moved more recently than the destination entry.
-                    // try to move the destination entry to the new location.
+        // has the entry moved? (scoped so the mutable borrow of dest_db ends
+        // before the pool-touching phases below)
+        {
+            #[allow(clippy::unwrap_used)] // id is guaranteed to exist in both dest and source
+            let mut dest_entry = dest_db.entry_mut(id).unwrap();
+            let dest_parent_id = dest_entry.as_ref().parent().id();
 
-                    if dest_entry.move_to(source_parent_id).is_ok() {
-                        log.events.push(MergeEvent {
-                            target: MergeEventTarget::Entry(id),
-                            event_type: MergeEventType::LocationUpdated,
-                        });
-                        dest_entry.times.location_changed = Some(slc);
-                    } else {
-                        log.warnings.push(format!(
-                            "Cannot move entry {} to group {} because the group does not exist in the destination database.",
-                            id,
-                            source_parent_id,
-                        ));
+            if dest_parent_id != source_parent_id {
+                // which move is more recent?
+                let source_location_changed = source_entry.times.location_changed;
+                let dest_location_changed = dest_entry.times.location_changed;
+                if let (Some(slc), Some(dlc)) = (source_location_changed, dest_location_changed) {
+                    if slc > dlc {
+                        // the source entry has been moved more recently than the destination entry.
+                        // try to move the destination entry to the new location.
+
+                        if dest_entry.move_to(source_parent_id).is_ok() {
+                            log.events.push(MergeEvent {
+                                target: MergeEventTarget::Entry(id),
+                                event_type: MergeEventType::LocationUpdated,
+                            });
+                            dest_entry.times.location_changed = Some(slc);
+                        } else {
+                            log.warnings.push(format!(
+                                "Cannot move entry {} to group {} because the group does not exist in the destination database.",
+                                id,
+                                source_parent_id,
+                            ));
+                        }
                     }
+                } else {
+                    log.warnings.push(format!(
+                        "Cannot determine which entry {} move is more recent because one of the entries does not have a location changed timestamp.",
+                        id,
+                    ));
                 }
-            } else {
-                log.warnings.push(format!(
-                    "Cannot determine which entry {} move is more recent because one of the entries does not have a location changed timestamp.",
-                    id,
-                ));
             }
         }
+
+        // Snapshot the destination entry so the comparisons and the history
+        // archive below can run while dest_db's attachment pool is mutated.
+        let dest_entry_snapshot = {
+            #[allow(clippy::unwrap_used)] // id is guaranteed to exist in both dest and source
+            let dest_entry = dest_db.entry(id).unwrap();
+            dest_entry.deref().clone()
+        };
 
         let source_last_modification = source_entry.times.last_modification.unwrap_or_else(|| {
             log.warnings.push(format!(
@@ -516,7 +532,7 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
             Times::epoch()
         });
 
-        let dest_last_modification = dest_entry.times.last_modification.unwrap_or_else(|| {
+        let dest_last_modification = dest_entry_snapshot.times.last_modification.unwrap_or_else(|| {
             log.warnings.push(format!(
                 "Destination entry {} did not have a last modification timestamp",
                 id
@@ -525,7 +541,7 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
         });
 
         if dest_last_modification == source_last_modification {
-            if have_entries_diverged(&dest_entry, &source_entry) {
+            if have_entries_diverged(&dest_entry_snapshot, dest_db, &source_entry, source_db) {
                 // This should never happen.
                 //
                 // An entry was updated without updating the last modification timestamp.
@@ -539,14 +555,14 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
             History::default()
         });
 
-        let dest_history = dest_entry.history.clone().unwrap_or_else(|| {
+        let dest_history = dest_entry_snapshot.history.clone().unwrap_or_else(|| {
             log.warnings
                 .push(format!("Destination entry {} had no history.", id));
             History::default()
         });
 
-        let mut merged_history = merge_history(&dest_history, &source_history, log)?;
-        let merged_location_timestamp = dest_entry
+        let mut merged_history = merge_history(&dest_history, &source_history, dest_db, source_db, log)?;
+        let merged_location_timestamp = dest_entry_snapshot
             .times
             .location_changed
             .or(source_entry.times.location_changed);
@@ -554,26 +570,33 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
         if source_last_modification > dest_last_modification {
             // add the previous dest entry to history if it has diverged
             if let Some(last_history_entry) = merged_history.entries.first() {
-                if have_entries_diverged(&dest_entry, last_history_entry) {
-                    let mut dest_entry_for_history = dest_entry.deref().clone();
+                if have_entries_diverged(&dest_entry_snapshot, dest_db, last_history_entry, dest_db) {
+                    let mut dest_entry_for_history = dest_entry_snapshot.clone();
                     dest_entry_for_history.history = None;
                     merged_history.add_entry(dest_entry_for_history);
                 }
             }
 
-            // The source entry is more recent than the destination entry. Replace dest with source.
-            dest_entry.times.last_modification = source_entry.times.last_modification;
-            dest_entry.fields = source_entry.fields.clone();
-            dest_entry.autotype = source_entry.autotype.clone();
-            dest_entry.tags = source_entry.tags.clone();
-            dest_entry.custom_data = source_entry.custom_data.clone();
-            dest_entry.icon = source_entry.icon.clone();
-            dest_entry.foreground_color = source_entry.foreground_color.clone();
-            dest_entry.background_color = source_entry.background_color.clone();
-            dest_entry.override_url = source_entry.override_url.clone();
-            dest_entry.quality_check = source_entry.quality_check;
+            // The source entry is more recent than the destination entry.
+            // Replace dest with source, importing the source's attachment
+            // bytes into the destination pool.
+            let mut incoming = source_entry.deref().clone();
+            incoming.history = None;
+            incoming.remap_attachments(source_db, dest_db);
 
-            // TODO: attachments and custom_icons_id
+            #[allow(clippy::unwrap_used)] // id is guaranteed to exist in both dest and source
+            let mut dest_entry = dest_db.entry_mut(id).unwrap();
+            dest_entry.times.last_modification = incoming.times.last_modification;
+            dest_entry.fields = incoming.fields;
+            dest_entry.autotype = incoming.autotype;
+            dest_entry.tags = incoming.tags;
+            dest_entry.custom_data = incoming.custom_data;
+            dest_entry.icon = incoming.icon;
+            dest_entry.foreground_color = incoming.foreground_color;
+            dest_entry.background_color = incoming.background_color;
+            dest_entry.override_url = incoming.override_url;
+            dest_entry.quality_check = incoming.quality_check;
+            dest_entry.attachments = incoming.attachments;
 
             log.events.push(MergeEvent {
                 target: MergeEventTarget::Entry(id),
@@ -581,6 +604,8 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
             });
         }
 
+        #[allow(clippy::unwrap_used)] // id is guaranteed to exist in both dest and source
+        let mut dest_entry = dest_db.entry_mut(id).unwrap();
         dest_entry.history = Some(merged_history);
         dest_entry.times.location_changed = merged_location_timestamp;
     }
@@ -589,7 +614,17 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
 }
 
 /// Merge two histories together, returning the merged history.
-fn merge_history(dest: &History, source: &History, log: &mut MergeLog) -> Result<History, MergeError> {
+///
+/// Source-side history versions are cloned out of `source_db` and therefore
+/// carry attachment references into the *source* pool; they are remapped into
+/// `dest_db`'s pool before merging.
+fn merge_history(
+    dest: &History,
+    source: &History,
+    dest_db: &mut Database,
+    source_db: &Database,
+    log: &mut MergeLog,
+) -> Result<History, MergeError> {
     let mut entries: Vec<Entry> = Vec::new();
 
     let mut entries_dest: Vec<Entry> = dest.entries.to_vec();
@@ -606,6 +641,7 @@ fn merge_history(dest: &History, source: &History, log: &mut MergeLog) -> Result
     }
 
     for e in entries_source.iter_mut() {
+        e.remap_attachments(source_db, dest_db);
         if e.times.last_modification.is_none() {
             log.warnings.push(format!(
                 "Source history entry {} did not have a last modification timestamp",
@@ -614,6 +650,10 @@ fn merge_history(dest: &History, source: &History, log: &mut MergeLog) -> Result
             e.times.last_modification = Some(Times::epoch());
         }
     }
+
+    // After the remap above, every version on both sides references dest_db's
+    // pool, so the equal-time comparisons below resolve against it alone.
+    let dest_db = &*dest_db;
 
     entries_dest.sort_by_key(|e| e.times.last_modification);
     entries_source.sort_by_key(|e| e.times.last_modification);
@@ -638,7 +678,7 @@ fn merge_history(dest: &History, source: &History, log: &mut MergeLog) -> Result
                     entries.push(entries_dest.pop().unwrap());
                 } else if source_time > dest_time {
                     entries.push(entries_source.pop().unwrap());
-                } else if have_entries_diverged(dest_entry, source_entry) {
+                } else if have_entries_diverged(dest_entry, dest_db, source_entry, dest_db) {
                     log.warnings.push(format!(
                         "History entries for {} have the same modification timestamp {} but have diverged.",
                         dest_entry.id(),
@@ -804,19 +844,11 @@ fn have_groups_diverged(a: &Group, b: &Group) -> bool {
     !a.eq(&b)
 }
 
-/// Check if two entries are dissimilar, ignoring their timestamps.
-fn have_entries_diverged(a: &Entry, b: &Entry) -> bool {
-    let new_times = Times::default();
-
-    let mut a = a.clone();
-    a.times = new_times.clone();
-    a.history = None;
-
-    let mut b = b.clone();
-    b.times = new_times.clone();
-    b.history = None;
-
-    !a.eq(&b)
+/// Check if two entries are dissimilar, ignoring their timestamps, history,
+/// and attachment pool ids (attachments compare by name and bytes, resolved
+/// against each entry's own database).
+fn have_entries_diverged(a: &Entry, a_db: &Database, b: &Entry, b_db: &Database) -> bool {
+    !a.content_equivalent(a_db, b, b_db)
 }
 
 #[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
@@ -824,7 +856,7 @@ fn have_entries_diverged(a: &Entry, b: &Entry) -> bool {
 mod merge_tests {
     use uuid::uuid;
 
-    use crate::db::{fields, EntryId, GroupId, History, Times};
+    use crate::db::{fields, AttachmentId, EntryId, GroupId, History, Times};
     use crate::Database;
 
     const ROOT_GROUP_ID: GroupId = GroupId::from_uuid(uuid!("00000000-0000-0000-0000-000000000001"));
@@ -2415,5 +2447,392 @@ mod merge_tests {
 
         let icon = destination_db.custom_icon(icon_id).unwrap();
         assert_eq!(icon.data, vec![5, 6, 7, 8]);
+    }
+
+    // ---- attachment merge tests ----
+    //
+    // These tests control modification times explicitly (instead of `sleep()`)
+    // because attachment adds/removes via `EntryMut` do not touch timestamps.
+
+    const ENTRY3_ID: EntryId = EntryId::from_uuid(uuid!("00000000-0000-0000-0000-000000000008"));
+
+    fn ts_at(minute: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+            .unwrap()
+            .and_hms_opt(12, minute, 0)
+            .unwrap()
+    }
+
+    fn set_last_modification(db: &mut Database, id: EntryId, at: chrono::NaiveDateTime) {
+        db.entry_mut(id).unwrap().times.last_modification = Some(at);
+    }
+
+    fn attach(db: &mut Database, id: EntryId, name: &str, bytes: &[u8]) {
+        let mut entry = db.entry_mut(id).unwrap();
+        entry.add_attachment(name, crate::db::Value::unprotected(bytes.to_vec()));
+    }
+
+    fn attachment_bytes(db: &Database, id: EntryId, name: &str) -> Option<Vec<u8>> {
+        db.entry(id)?
+            .attachment_by_name(name)
+            .map(|a| a.data.get().clone())
+    }
+
+    /// An attachment added on the newer source side must land in the
+    /// destination pool with its bytes, not be silently dropped.
+    #[test]
+    fn test_merge_attachment_added_in_source() {
+        let mut destination_db = create_test_database();
+        set_last_modification(&mut destination_db, ENTRY1_ID, ts_at(0));
+        let mut source_db = destination_db.clone();
+
+        attach(&mut source_db, ENTRY1_ID, "invoice.pdf", b"pdf bytes");
+        set_last_modification(&mut source_db, ENTRY1_ID, ts_at(5));
+
+        let merge_result = destination_db.merge(&source_db).unwrap();
+        assert_eq!(merge_result.events.len(), 1);
+
+        assert_eq!(
+            attachment_bytes(&destination_db, ENTRY1_ID, "invoice.pdf").as_deref(),
+            Some(b"pdf bytes".as_slice()),
+            "attachment added on the newer source side must survive the merge"
+        );
+    }
+
+    /// An attachment whose bytes were replaced on the newer source side must
+    /// carry the new bytes into the destination.
+    #[test]
+    fn test_merge_attachment_replaced_in_source() {
+        let mut destination_db = create_test_database();
+        attach(&mut destination_db, ENTRY1_ID, "doc.txt", b"v1");
+        set_last_modification(&mut destination_db, ENTRY1_ID, ts_at(0));
+        let mut source_db = destination_db.clone();
+
+        attach(&mut source_db, ENTRY1_ID, "doc.txt", b"v2");
+        set_last_modification(&mut source_db, ENTRY1_ID, ts_at(5));
+
+        destination_db.merge(&source_db).unwrap();
+
+        assert_eq!(
+            attachment_bytes(&destination_db, ENTRY1_ID, "doc.txt").as_deref(),
+            Some(b"v2".as_slice()),
+            "replaced attachment bytes from the newer source side must win"
+        );
+    }
+
+    /// An attachment removed on the newer source side must be removed from
+    /// the destination entry as well.
+    #[test]
+    fn test_merge_attachment_removed_in_source() {
+        let mut destination_db = create_test_database();
+        attach(&mut destination_db, ENTRY1_ID, "old.txt", b"old bytes");
+        set_last_modification(&mut destination_db, ENTRY1_ID, ts_at(0));
+        let mut source_db = destination_db.clone();
+
+        source_db
+            .entry_mut(ENTRY1_ID)
+            .unwrap()
+            .remove_attachment_by_name("old.txt");
+        set_last_modification(&mut source_db, ENTRY1_ID, ts_at(5));
+
+        destination_db.merge(&source_db).unwrap();
+
+        assert!(
+            attachment_bytes(&destination_db, ENTRY1_ID, "old.txt").is_none(),
+            "attachment removed on the newer source side must be removed by the merge"
+        );
+    }
+
+    /// A brand-new entry from the source arrives with `AttachmentId`s minted
+    /// in the *source* pool. Those ids must be remapped into the destination
+    /// pool — otherwise they dangle or, worse, collide with an unrelated
+    /// destination blob and show the wrong bytes.
+    #[test]
+    fn test_merge_new_entry_attachments_remapped_across_pools() {
+        let mut destination_db = create_test_database();
+        let mut source_db = destination_db.clone();
+
+        // Destination pool: id 0 = "local blob".
+        attach(&mut destination_db, ENTRY1_ID, "local.bin", b"local blob");
+        set_last_modification(&mut destination_db, ENTRY1_ID, ts_at(5));
+        set_last_modification(&mut source_db, ENTRY1_ID, ts_at(0));
+
+        // Source pool: id 0 = "remote blob", on a new entry — colliding ids,
+        // different bytes.
+        source_db
+            .root_mut()
+            .add_entry_with_id(ENTRY3_ID)
+            .unwrap()
+            .edit(|e| e.set_unprotected("Title", "entry3"));
+        attach(&mut source_db, ENTRY3_ID, "remote.bin", b"remote blob");
+        set_last_modification(&mut source_db, ENTRY3_ID, ts_at(1));
+
+        destination_db.merge(&source_db).unwrap();
+
+        assert_eq!(
+            attachment_bytes(&destination_db, ENTRY3_ID, "remote.bin").as_deref(),
+            Some(b"remote blob".as_slice()),
+            "new entry's attachment must resolve to its own bytes, not a colliding local blob"
+        );
+        assert_eq!(
+            attachment_bytes(&destination_db, ENTRY1_ID, "local.bin").as_deref(),
+            Some(b"local blob".as_slice()),
+            "existing local attachment must be untouched"
+        );
+    }
+
+    /// Re-merging the same source after attachment remapping must be a no-op,
+    /// even though the remapped destination ids no longer equal the source ids.
+    #[test]
+    fn test_remerge_after_attachment_remap_is_idempotent() {
+        let mut destination_db = create_test_database();
+        let mut source_db = destination_db.clone();
+
+        attach(&mut destination_db, ENTRY1_ID, "local.bin", b"local blob");
+        set_last_modification(&mut destination_db, ENTRY1_ID, ts_at(5));
+        set_last_modification(&mut source_db, ENTRY1_ID, ts_at(0));
+
+        source_db
+            .root_mut()
+            .add_entry_with_id(ENTRY3_ID)
+            .unwrap()
+            .edit(|e| e.set_unprotected("Title", "entry3"));
+        attach(&mut source_db, ENTRY3_ID, "remote.bin", b"remote blob");
+        set_last_modification(&mut source_db, ENTRY3_ID, ts_at(1));
+
+        destination_db.merge(&source_db).unwrap();
+        let after_first_merge = destination_db.clone();
+
+        let merge_result = destination_db.merge(&source_db).unwrap();
+
+        assert_eq!(merge_result.events.len(), 0, "re-merge must produce no events");
+        assert_eq!(
+            destination_db, after_first_merge,
+            "re-merging the same source must not change the database"
+        );
+    }
+
+    /// Entries whose content is identical — including attachment names and
+    /// bytes — must not count as diverged just because their pools assigned
+    /// different `AttachmentId`s. With equal timestamps this previously
+    /// surfaced as a hard `EntryModificationTimeNotUpdated` error.
+    #[test]
+    fn test_equal_content_with_different_attachment_ids_is_not_divergence() {
+        let base = create_test_database();
+
+        // Same (name, bytes) on both sides, added in opposite order so the
+        // pool ids differ: dest has x.bin=0/same.txt=1, source the reverse.
+        let mut destination_db = base.clone();
+        attach(&mut destination_db, ENTRY2_ID, "x.bin", b"X");
+        attach(&mut destination_db, ENTRY1_ID, "same.txt", b"S");
+
+        let mut source_db = base;
+        attach(&mut source_db, ENTRY1_ID, "same.txt", b"S");
+        attach(&mut source_db, ENTRY2_ID, "x.bin", b"X");
+
+        for db in [&mut destination_db, &mut source_db] {
+            set_last_modification(db, ENTRY1_ID, ts_at(3));
+            set_last_modification(db, ENTRY2_ID, ts_at(3));
+        }
+
+        let merge_result = destination_db
+            .merge(&source_db)
+            .expect("content-identical entries with drifted attachment ids must merge cleanly");
+
+        assert_eq!(merge_result.events.len(), 0);
+        assert_eq!(
+            attachment_bytes(&destination_db, ENTRY1_ID, "same.txt").as_deref(),
+            Some(b"S".as_slice())
+        );
+    }
+
+    /// History versions imported from the source carry source-pool ids too;
+    /// after the merge they must resolve to the correct bytes in the
+    /// destination pool.
+    #[test]
+    fn test_merge_history_version_attachments_remapped() {
+        let mut destination_db = create_test_database();
+        let mut source_db = destination_db.clone();
+
+        // Occupy destination id 0 with unrelated bytes to force a collision.
+        attach(&mut destination_db, ENTRY2_ID, "pad.bin", b"PAD");
+        set_last_modification(&mut destination_db, ENTRY2_ID, ts_at(1));
+        set_last_modification(&mut destination_db, ENTRY1_ID, ts_at(0));
+        set_last_modification(&mut source_db, ENTRY2_ID, ts_at(0));
+
+        // Source: v1 attached, archived into history, then replaced by v2.
+        attach(&mut source_db, ENTRY1_ID, "doc.txt", b"v1");
+        set_last_modification(&mut source_db, ENTRY1_ID, ts_at(2));
+        {
+            let mut entry = source_db.entry_mut(ENTRY1_ID).unwrap();
+            let pre_image = std::ops::Deref::deref(&entry).clone();
+            entry.history.get_or_insert_default().add_entry(pre_image);
+        }
+        attach(&mut source_db, ENTRY1_ID, "doc.txt", b"v2");
+        set_last_modification(&mut source_db, ENTRY1_ID, ts_at(5));
+
+        destination_db.merge(&source_db).unwrap();
+
+        assert_eq!(
+            attachment_bytes(&destination_db, ENTRY1_ID, "doc.txt").as_deref(),
+            Some(b"v2".as_slice()),
+            "live version must carry the newest bytes"
+        );
+        // The merged history holds the imported v1 version (and the archived
+        // destination pre-image, which carried no attachment) — find the
+        // version that references doc.txt and check its bytes.
+        let entry = destination_db.entry(ENTRY1_ID).unwrap();
+        let history_len = entry.history.as_ref().map_or(0, |h| h.entries.len());
+        let historical_bytes = (0..history_len)
+            .filter_map(|i| entry.historical(i))
+            .find_map(|version| {
+                version
+                    .attachment_by_name("doc.txt")
+                    .map(|a| a.data.get().clone())
+            });
+        assert_eq!(
+            historical_bytes.as_deref(),
+            Some(b"v1".as_slice()),
+            "history version's attachment must resolve to v1 bytes, not a colliding blob"
+        );
+        assert_eq!(
+            attachment_bytes(&destination_db, ENTRY2_ID, "pad.bin").as_deref(),
+            Some(b"PAD".as_slice())
+        );
+    }
+
+    fn attachment_id(db: &Database, id: EntryId, name: &str) -> Option<AttachmentId> {
+        Some(db.entry(id)?.attachment_by_name(name)?.id())
+    }
+
+    /// Two source entries that reference byte-identical attachments (with
+    /// distinct source-pool ids) must collapse to a single shared blob in the
+    /// destination pool — cross-entry sharing is preserved, not duplicated.
+    #[test]
+    fn test_merge_cross_entry_attachment_sharing_is_preserved() {
+        let mut destination_db = create_test_database();
+        set_last_modification(&mut destination_db, ENTRY1_ID, ts_at(0));
+        set_last_modification(&mut destination_db, ENTRY2_ID, ts_at(0));
+        let mut source_db = destination_db.clone();
+
+        // Same bytes attached to two different entries: `add_attachment` mints
+        // distinct source-pool ids (no within-db dedup on add).
+        attach(&mut source_db, ENTRY1_ID, "a.bin", b"shared payload");
+        attach(&mut source_db, ENTRY2_ID, "b.bin", b"shared payload");
+        assert_ne!(
+            attachment_id(&source_db, ENTRY1_ID, "a.bin"),
+            attachment_id(&source_db, ENTRY2_ID, "b.bin"),
+            "precondition: the two source attachments must have distinct ids"
+        );
+        set_last_modification(&mut source_db, ENTRY1_ID, ts_at(5));
+        set_last_modification(&mut source_db, ENTRY2_ID, ts_at(5));
+
+        destination_db.merge(&source_db).unwrap();
+
+        assert_eq!(
+            attachment_id(&destination_db, ENTRY1_ID, "a.bin"),
+            attachment_id(&destination_db, ENTRY2_ID, "b.bin"),
+            "byte-identical attachments must share one destination id after merge"
+        );
+        assert_eq!(
+            destination_db.num_attachments(),
+            1,
+            "the shared payload must be stored once, not duplicated per entry"
+        );
+    }
+
+    /// A source attachment whose bytes already exist in the destination pool
+    /// (attached to an unrelated entry) must reuse that blob's id rather than
+    /// allocating a duplicate.
+    #[test]
+    fn test_merge_reuses_existing_destination_blob() {
+        let mut destination_db = create_test_database();
+        attach(&mut destination_db, ENTRY1_ID, "local.bin", b"shared");
+        set_last_modification(&mut destination_db, ENTRY1_ID, ts_at(5));
+        set_last_modification(&mut destination_db, ENTRY2_ID, ts_at(0));
+        assert_eq!(destination_db.num_attachments(), 1);
+
+        // Source brings the same bytes on a different entry (newer, so it
+        // updates the destination entry).
+        let mut source_db = destination_db.clone();
+        attach(&mut source_db, ENTRY2_ID, "copy.bin", b"shared");
+        set_last_modification(&mut source_db, ENTRY2_ID, ts_at(5));
+
+        destination_db.merge(&source_db).unwrap();
+
+        assert_eq!(
+            attachment_id(&destination_db, ENTRY2_ID, "copy.bin"),
+            attachment_id(&destination_db, ENTRY1_ID, "local.bin"),
+            "imported attachment must reuse the byte-identical blob already in the pool"
+        );
+        assert_eq!(
+            destination_db.num_attachments(),
+            1,
+            "reusing an existing blob must not grow the pool"
+        );
+    }
+
+    /// A source `name -> AttachmentId` reference whose blob is missing from the
+    /// source pool (a dangling reference) must be dropped during remap, not
+    /// carried into the destination as a reference to nonexistent bytes.
+    #[test]
+    fn test_merge_drops_dangling_source_reference() {
+        let mut destination_db = create_test_database();
+        set_last_modification(&mut destination_db, ENTRY1_ID, ts_at(0));
+        let mut source_db = destination_db.clone();
+
+        attach(&mut source_db, ENTRY1_ID, "ghost.bin", b"soon gone");
+        // Drop the blob from the pool but leave the entry's reference behind,
+        // fabricating a dangling `name -> id` that remap must not propagate.
+        let dangling = attachment_id(&source_db, ENTRY1_ID, "ghost.bin").unwrap();
+        source_db.attachments.remove(&dangling);
+        set_last_modification(&mut source_db, ENTRY1_ID, ts_at(5));
+
+        destination_db
+            .merge(&source_db)
+            .expect("a dangling source reference must not break the merge");
+
+        assert!(
+            attachment_id(&destination_db, ENTRY1_ID, "ghost.bin").is_none(),
+            "a reference whose blob is absent from the source pool must be dropped"
+        );
+    }
+
+    /// Locks in the documented dedup contract flagged by the Codex P2 review:
+    /// two distinct source attachments on the *same* entry that carry identical
+    /// bytes collapse to a single destination id. This matches the KDBX
+    /// format's byte-identical binary sharing; the test exists so any future
+    /// change to that behavior is deliberate and visible.
+    #[test]
+    fn test_merge_distinct_equal_byte_attachments_dedup_on_same_entry() {
+        let mut destination_db = create_test_database();
+        set_last_modification(&mut destination_db, ENTRY1_ID, ts_at(0));
+        let mut source_db = destination_db.clone();
+
+        attach(&mut source_db, ENTRY1_ID, "one.bin", b"identical");
+        attach(&mut source_db, ENTRY1_ID, "two.bin", b"identical");
+        assert_ne!(
+            attachment_id(&source_db, ENTRY1_ID, "one.bin"),
+            attachment_id(&source_db, ENTRY1_ID, "two.bin"),
+            "precondition: distinct source ids for the two equal-byte attachments"
+        );
+        set_last_modification(&mut source_db, ENTRY1_ID, ts_at(5));
+
+        destination_db.merge(&source_db).unwrap();
+
+        assert_eq!(
+            attachment_bytes(&destination_db, ENTRY1_ID, "one.bin").as_deref(),
+            Some(b"identical".as_slice()),
+        );
+        assert_eq!(
+            attachment_bytes(&destination_db, ENTRY1_ID, "two.bin").as_deref(),
+            Some(b"identical".as_slice()),
+        );
+        assert_eq!(
+            attachment_id(&destination_db, ENTRY1_ID, "one.bin"),
+            attachment_id(&destination_db, ENTRY1_ID, "two.bin"),
+            "equal-byte attachments are content-addressed to one shared id (documented dedup)"
+        );
+        assert_eq!(destination_db.num_attachments(), 1);
     }
 }
