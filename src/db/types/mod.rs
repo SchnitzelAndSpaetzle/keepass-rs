@@ -359,6 +359,32 @@ impl Database {
     /// binaries are never written back even if this is not called; use this to also drop them from
     /// the in-memory pool (e.g. to reflect the change in [`Database::num_attachments`]).
     ///
+    /// Returns the id of a pool attachment whose data equals `data`, inserting the data as a new
+    /// attachment if no equal blob exists. When several pool blobs carry equal data, the smallest
+    /// id wins so the result is deterministic.
+    pub(crate) fn intern_attachment(&mut self, data: &Value<Vec<u8>>) -> AttachmentId {
+        let mut equal_ids: Vec<AttachmentId> = self
+            .attachments
+            .values()
+            .filter(|attachment| &attachment.data == data)
+            .map(Attachment::id)
+            .collect();
+        equal_ids.sort_by_key(AttachmentId::id);
+        if let Some(&id) = equal_ids.first() {
+            return id;
+        }
+
+        let id = AttachmentId::next_free(self);
+        self.attachments.insert(
+            id,
+            Attachment {
+                id,
+                data: data.clone(),
+            },
+        );
+        id
+    }
+
     /// Any `name -> AttachmentId` reference whose target binary is absent from the pool is also
     /// dropped from the entry/history map as part of the re-index.
     pub fn compact_attachments(&mut self) {
