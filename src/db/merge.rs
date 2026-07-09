@@ -80,15 +80,44 @@ pub struct MergeLog {
 }
 
 impl Database {
+    /// Merge a database with another version of the same database and a common ancestor,
+    /// applying the changes to self.
+    ///
+    /// This is a three-way merge. Providing the last-known-common ancestor lets the merge
+    /// distinguish a one-sided change from a true conflict:
+    ///
+    /// - Changed in `self` only (since `ancestor`) → keep `self`'s value, silently.
+    /// - Changed in `other` only → take `other`'s value, silently.
+    /// - Changed identically in both → trivially resolved.
+    /// - Changed differently in both → real conflict: resolved by newest-wins and surfaced in
+    ///   [`MergeLog::warnings`].
+    ///
+    /// UUIDs are used to detect which entries and groups are the same across the three databases.
+    /// Use [`Database::merge`] when no ancestor is available; it degrades to two-way (newest-wins)
+    /// semantics by treating an empty database as the ancestor, so every object looks changed on
+    /// both sides.
+    pub fn merge_with_ancestor(
+        &mut self,
+        other: &Database,
+        ancestor: &Database,
+    ) -> Result<MergeLog, MergeError> {
+        let mut log = MergeLog::default();
+        merge_icons(self, other, ancestor, &mut log)?;
+        merge_groups(self, other, ancestor, &mut log)?;
+
+        Ok(log)
+    }
+
     /// Merge a database with another version of the same database, applying the changes to self.
+    ///
+    /// This is a two-way merge: conflicts are resolved by `last_modification` timestamp alone
+    /// (newest-wins). When a last-known-common ancestor is available,
+    /// [`Database::merge_with_ancestor`] resolves one-sided changes automatically and surfaces
+    /// true conflicts more precisely.
     ///
     /// This function will use the UUIDs to detect what entries and groups are the same.
     pub fn merge(&mut self, other: &Database) -> Result<MergeLog, MergeError> {
-        let mut log = MergeLog::default();
-        merge_icons(self, other, &mut log)?;
-        merge_groups(self, other, &mut log)?;
-
-        Ok(log)
+        self.merge_with_ancestor(other, &Database::new())
     }
 }
 
@@ -111,7 +140,12 @@ fn get_last_update(group: GroupRef<'_>) -> Option<NaiveDateTime> {
 /// Merge groups from `source` into `dest`, appending to a log of the merge process.
 ///
 /// NOTE: this function will also call `merge_entries` to handle entries within the groups.
-fn merge_groups(dest_db: &mut Database, source_db: &Database, log: &mut MergeLog) -> Result<(), MergeError> {
+fn merge_groups(
+    dest_db: &mut Database,
+    source_db: &Database,
+    base_db: &Database,
+    log: &mut MergeLog,
+) -> Result<(), MergeError> {
     let dest_groups = dest_db.groups.keys().cloned().collect::<HashSet<_>>();
     let source_groups = source_db.groups.keys().cloned().collect::<HashSet<_>>();
 
@@ -243,7 +277,7 @@ fn merge_groups(dest_db: &mut Database, source_db: &Database, log: &mut MergeLog
     // perform the entry merges now that all groups that need adding are added but the groups that
     // need deleting still haven't been deleted, so that the entries can still be accessed and
     // generate events
-    merge_entries(dest_db, source_db, log)?;
+    merge_entries(dest_db, source_db, base_db, log)?;
 
     // perform all group deletions
     while let Some(id) = to_delete.pop() {
@@ -337,6 +371,23 @@ fn merge_groups(dest_db: &mut Database, source_db: &Database, log: &mut MergeLog
             continue;
         }
 
+        // Three-way check (see `merge_entries` for the rationale and the two-way no-op property).
+        let base_lm = base_db.group(id).and_then(|g| g.times.last_modification);
+        let dest_changed = base_lm.is_none_or(|b| dest_last_modification > b);
+        let source_changed = base_lm.is_none_or(|b| source_last_modification > b);
+
+        if !source_changed {
+            // The source contributed nothing since the ancestor; keep the destination as-is.
+            continue;
+        }
+
+        if dest_changed && base_lm.is_some() && have_groups_diverged(&dest, &source) {
+            log.warnings.push(format!(
+                "Group {id} was modified in both databases since the common ancestor. \
+                 Resolving by keeping the most recently modified version.",
+            ));
+        }
+
         if dest_last_modification > source_last_modification {
             // The destination group is more recent than the source group. Nothing to do.
             continue;
@@ -371,7 +422,12 @@ fn merge_groups(dest_db: &mut Database, source_db: &Database, log: &mut MergeLog
 }
 
 /// Merge entries from `source` into `dest`, appending to a log of the merge process.
-fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLog) -> Result<(), MergeError> {
+fn merge_entries(
+    dest_db: &mut Database,
+    source_db: &Database,
+    base_db: &Database,
+    log: &mut MergeLog,
+) -> Result<(), MergeError> {
     let dest_entries = dest_db.entries.keys().cloned().collect::<HashSet<_>>();
     let source_entries = source_db.entries.keys().cloned().collect::<HashSet<_>>();
 
@@ -550,6 +606,29 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
             continue;
         }
 
+        // Three-way check: compare both sides against the common ancestor to distinguish a
+        // one-sided change (auto-resolved) from a true conflict (warned, then newest-wins).
+        // With the empty ancestor used by the two-way `merge` shim, `base_lm` is `None`, so both
+        // sides count as changed and the warning is suppressed — a no-op overlay.
+        let base_lm = base_db.entry(id).and_then(|e| e.times.last_modification);
+        let dest_changed = base_lm.is_none_or(|b| dest_last_modification > b);
+        let source_changed = base_lm.is_none_or(|b| source_last_modification > b);
+
+        if !source_changed {
+            // The source contributed nothing since the ancestor; keep the destination as-is.
+            continue;
+        }
+
+        if dest_changed
+            && base_lm.is_some()
+            && have_entries_diverged(&dest_entry_snapshot, dest_db, &source_entry, source_db)
+        {
+            log.warnings.push(format!(
+                "Entry {id} was modified in both databases since the common ancestor. \
+                 Resolving by keeping the most recently modified version.",
+            ));
+        }
+
         let source_history = source_entry.history.clone().unwrap_or_else(|| {
             log.warnings.push(format!("Source entry {} had no history.", id));
             History::default()
@@ -711,7 +790,12 @@ fn merge_history(
 }
 
 /// Merge custom icons, returning the merged history
-fn merge_icons(dest_db: &mut Database, source_db: &Database, log: &mut MergeLog) -> Result<(), MergeError> {
+fn merge_icons(
+    dest_db: &mut Database,
+    source_db: &Database,
+    base_db: &Database,
+    log: &mut MergeLog,
+) -> Result<(), MergeError> {
     let dest_icons = dest_db.custom_icons.keys().cloned().collect::<HashSet<_>>();
     let source_icons = source_db.custom_icons.keys().cloned().collect::<HashSet<_>>();
 
@@ -809,6 +893,29 @@ fn merge_icons(dest_db: &mut Database, source_db: &Database, log: &mut MergeLog)
             continue;
         }
 
+        // Three-way check (see `merge_entries`). Icons that predate the ancestor timestamp map to
+        // `epoch`, and the warning is gated on the id existing in the ancestor, so the two-way
+        // shim's empty ancestor makes this a no-op overlay.
+        let base_last_modification = base_db
+            .custom_icons
+            .get(&id)
+            .and_then(|i| i.last_modification_time)
+            .unwrap_or_else(Times::epoch);
+        let dest_changed = dest_last_modification > base_last_modification;
+        let source_changed = source_last_modification > base_last_modification;
+
+        if !source_changed {
+            // The source contributed nothing since the ancestor; keep the destination as-is.
+            continue;
+        }
+
+        if dest_changed && dest_icon != source_icon && base_db.custom_icons.contains_key(&id) {
+            log.warnings.push(format!(
+                "Custom icon {id} was modified in both databases since the common ancestor. \
+                 Resolving by keeping the most recently modified version.",
+            ));
+        }
+
         if dest_last_modification > source_last_modification {
             // The destination icon is more recent than the source icon. Nothing to do.
             continue;
@@ -834,12 +941,16 @@ fn have_groups_diverged(a: &Group, b: &Group) -> bool {
     a.entries.clear();
     a.groups.clear();
     a.parent = None;
+    // previous_parent_group tracks location history, not content; exclude it so a moved group is
+    // not mistaken for a true three-way content conflict.
+    a.previous_parent_group = None;
 
     let mut b = b.clone();
     b.times = new_times.clone();
     b.entries.clear();
     b.groups.clear();
     b.parent = None;
+    b.previous_parent_group = None;
 
     !a.eq(&b)
 }
@@ -2834,5 +2945,256 @@ mod merge_tests {
             "equal-byte attachments are content-addressed to one shared id (documented dedup)"
         );
         assert_eq!(destination_db.num_attachments(), 1);
+    }
+
+    // ---- three-way merge (merge_with_ancestor) tests ----
+    //
+    // `self` = destination, `other` = source, plus a common `ancestor`. Timestamps are set
+    // explicitly (no `sleep()`) so the one-sided-vs-conflict decision is deterministic.
+
+    /// Set an entry's title without touching its timestamps or history, so the test controls
+    /// modification times explicitly.
+    fn set_title(db: &mut Database, id: EntryId, t: &str) {
+        db.entry_mut(id).unwrap().edit(|e| {
+            e.set_unprotected(fields::TITLE, t);
+        });
+    }
+
+    fn title(db: &Database, id: EntryId) -> Option<String> {
+        db.entry(id)?.get(fields::TITLE).map(str::to_string)
+    }
+
+    /// Changed on the `other` side only since the ancestor: take other's value, no warning.
+    #[test]
+    fn test_ancestor_one_sided_change_in_other() {
+        let mut ancestor_db = create_test_database();
+        set_title(&mut ancestor_db, ENTRY1_ID, "base");
+        set_last_modification(&mut ancestor_db, ENTRY1_ID, ts_at(0));
+
+        let mut destination_db = ancestor_db.clone();
+        let mut source_db = ancestor_db.clone();
+
+        set_title(&mut source_db, ENTRY1_ID, "changed_in_other");
+        set_last_modification(&mut source_db, ENTRY1_ID, ts_at(5));
+
+        let result = destination_db
+            .merge_with_ancestor(&source_db, &ancestor_db)
+            .unwrap();
+
+        assert_eq!(result.warnings.len(), 0, "a one-sided change must not warn");
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(
+            title(&destination_db, ENTRY1_ID).as_deref(),
+            Some("changed_in_other")
+        );
+    }
+
+    /// Changed on the `self` side only since the ancestor: keep self's value, no warning, no event.
+    #[test]
+    fn test_ancestor_one_sided_change_in_self() {
+        let mut ancestor_db = create_test_database();
+        set_title(&mut ancestor_db, ENTRY1_ID, "base");
+        set_last_modification(&mut ancestor_db, ENTRY1_ID, ts_at(0));
+
+        let mut destination_db = ancestor_db.clone();
+        let source_db = ancestor_db.clone();
+
+        set_title(&mut destination_db, ENTRY1_ID, "changed_in_self");
+        set_last_modification(&mut destination_db, ENTRY1_ID, ts_at(5));
+
+        let result = destination_db
+            .merge_with_ancestor(&source_db, &ancestor_db)
+            .unwrap();
+
+        assert_eq!(result.warnings.len(), 0, "a one-sided change must not warn");
+        assert_eq!(result.events.len(), 0, "self already holds the winning value");
+        assert_eq!(
+            title(&destination_db, ENTRY1_ID).as_deref(),
+            Some("changed_in_self")
+        );
+    }
+
+    /// Changed differently on both sides since the ancestor: exactly one warning, newest wins.
+    #[test]
+    fn test_ancestor_true_conflict_warns_and_newest_wins() {
+        let mut ancestor_db = create_test_database();
+        set_title(&mut ancestor_db, ENTRY1_ID, "base");
+        set_last_modification(&mut ancestor_db, ENTRY1_ID, ts_at(0));
+
+        let mut destination_db = ancestor_db.clone();
+        let mut source_db = ancestor_db.clone();
+
+        set_title(&mut destination_db, ENTRY1_ID, "changed_in_self");
+        set_last_modification(&mut destination_db, ENTRY1_ID, ts_at(5));
+
+        set_title(&mut source_db, ENTRY1_ID, "changed_in_other");
+        set_last_modification(&mut source_db, ENTRY1_ID, ts_at(10));
+
+        let result = destination_db
+            .merge_with_ancestor(&source_db, &ancestor_db)
+            .unwrap();
+
+        assert_eq!(result.warnings.len(), 1, "a true conflict must warn exactly once");
+        assert_eq!(
+            title(&destination_db, ENTRY1_ID).as_deref(),
+            Some("changed_in_other"),
+            "the most recently modified side must win"
+        );
+    }
+
+    /// Re-running the same three-way merge changes nothing (no events, no warnings).
+    #[test]
+    fn test_ancestor_merge_is_idempotent() {
+        let mut ancestor_db = create_test_database();
+        set_title(&mut ancestor_db, ENTRY1_ID, "base");
+        set_last_modification(&mut ancestor_db, ENTRY1_ID, ts_at(0));
+
+        let mut destination_db = ancestor_db.clone();
+        let mut source_db = ancestor_db.clone();
+
+        set_title(&mut destination_db, ENTRY1_ID, "changed_in_self");
+        set_last_modification(&mut destination_db, ENTRY1_ID, ts_at(5));
+        set_title(&mut source_db, ENTRY1_ID, "changed_in_other");
+        set_last_modification(&mut source_db, ENTRY1_ID, ts_at(10));
+
+        destination_db
+            .merge_with_ancestor(&source_db, &ancestor_db)
+            .unwrap();
+        let after_first = destination_db.clone();
+
+        let result = destination_db
+            .merge_with_ancestor(&source_db, &ancestor_db)
+            .unwrap();
+
+        assert_eq!(result.events.len(), 0, "re-merge must produce no events");
+        assert_eq!(result.warnings.len(), 0, "re-merge must produce no warnings");
+        assert_eq!(
+            destination_db, after_first,
+            "re-merge must not change the database"
+        );
+    }
+
+    /// Backward-compatibility: the two-way `merge` shim must not raise the three-way
+    /// "modified in both databases" warning, even on a conflicting change.
+    #[test]
+    fn test_two_way_shim_no_ancestor_warning_on_conflict() {
+        let mut ancestor_db = create_test_database();
+        set_title(&mut ancestor_db, ENTRY1_ID, "base");
+        set_last_modification(&mut ancestor_db, ENTRY1_ID, ts_at(0));
+
+        let mut destination_db = ancestor_db.clone();
+        let mut source_db = ancestor_db.clone();
+
+        set_title(&mut destination_db, ENTRY1_ID, "changed_in_self");
+        set_last_modification(&mut destination_db, ENTRY1_ID, ts_at(5));
+        set_title(&mut source_db, ENTRY1_ID, "changed_in_other");
+        set_last_modification(&mut source_db, ENTRY1_ID, ts_at(10));
+
+        let result = destination_db.merge(&source_db).unwrap();
+
+        assert_eq!(
+            result.warnings.len(),
+            0,
+            "the two-way shim must not emit ancestor conflicts"
+        );
+        assert_eq!(
+            title(&destination_db, ENTRY1_ID).as_deref(),
+            Some("changed_in_other"),
+            "two-way newest-wins still applies"
+        );
+    }
+
+    /// Three-way × attachments: an attachment added only on the source side is imported silently.
+    #[test]
+    fn test_ancestor_one_sided_attachment_add_in_source() {
+        let mut ancestor_db = create_test_database();
+        set_last_modification(&mut ancestor_db, ENTRY1_ID, ts_at(0));
+
+        let mut destination_db = ancestor_db.clone();
+        let mut source_db = ancestor_db.clone();
+
+        attach(&mut source_db, ENTRY1_ID, "file.pdf", b"pdf bytes");
+        set_last_modification(&mut source_db, ENTRY1_ID, ts_at(5));
+
+        let result = destination_db
+            .merge_with_ancestor(&source_db, &ancestor_db)
+            .unwrap();
+
+        assert_eq!(
+            result.warnings.len(),
+            0,
+            "a one-sided attachment add must not warn"
+        );
+        assert_eq!(
+            attachment_bytes(&destination_db, ENTRY1_ID, "file.pdf").as_deref(),
+            Some(b"pdf bytes".as_slice()),
+        );
+    }
+
+    /// Three-way × attachments: the same attachment changed differently on both sides is a true
+    /// conflict — one warning, newest bytes win, and they resolve to the correct pool bytes.
+    #[test]
+    fn test_ancestor_attachment_conflict_warns_and_newest_bytes_win() {
+        let mut ancestor_db = create_test_database();
+        attach(&mut ancestor_db, ENTRY1_ID, "doc.txt", b"v0");
+        set_last_modification(&mut ancestor_db, ENTRY1_ID, ts_at(0));
+
+        let mut destination_db = ancestor_db.clone();
+        let mut source_db = ancestor_db.clone();
+
+        attach(&mut destination_db, ENTRY1_ID, "doc.txt", b"v-self");
+        set_last_modification(&mut destination_db, ENTRY1_ID, ts_at(5));
+        attach(&mut source_db, ENTRY1_ID, "doc.txt", b"v-other");
+        set_last_modification(&mut source_db, ENTRY1_ID, ts_at(10));
+
+        let result = destination_db
+            .merge_with_ancestor(&source_db, &ancestor_db)
+            .unwrap();
+
+        assert_eq!(
+            result.warnings.len(),
+            1,
+            "diverged attachments are a true conflict"
+        );
+        assert_eq!(
+            attachment_bytes(&destination_db, ENTRY1_ID, "doc.txt").as_deref(),
+            Some(b"v-other".as_slice()),
+            "the newest side's attachment bytes must win and resolve correctly"
+        );
+    }
+
+    /// Three-way × attachments: when the source did not change since the ancestor, the
+    /// destination's own attachment changes are kept and nothing is imported from the source.
+    #[test]
+    fn test_ancestor_source_unchanged_keeps_destination_attachments() {
+        let mut ancestor_db = create_test_database();
+        attach(&mut ancestor_db, ENTRY1_ID, "keep.txt", b"orig");
+        set_last_modification(&mut ancestor_db, ENTRY1_ID, ts_at(0));
+
+        let mut destination_db = ancestor_db.clone();
+        let source_db = ancestor_db.clone();
+
+        attach(&mut destination_db, ENTRY1_ID, "extra.txt", b"dest-only");
+        set_last_modification(&mut destination_db, ENTRY1_ID, ts_at(5));
+
+        let result = destination_db
+            .merge_with_ancestor(&source_db, &ancestor_db)
+            .unwrap();
+
+        assert_eq!(result.warnings.len(), 0);
+        assert_eq!(
+            result.events.len(),
+            0,
+            "source unchanged since ancestor → nothing to apply"
+        );
+        assert_eq!(
+            attachment_bytes(&destination_db, ENTRY1_ID, "extra.txt").as_deref(),
+            Some(b"dest-only".as_slice()),
+            "the destination's own attachment must be kept"
+        );
+        assert_eq!(
+            attachment_bytes(&destination_db, ENTRY1_ID, "keep.txt").as_deref(),
+            Some(b"orig".as_slice()),
+        );
     }
 }
