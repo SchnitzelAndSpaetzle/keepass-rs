@@ -10,7 +10,10 @@ use chrono::NaiveDateTime;
 use thiserror::Error;
 
 use crate::{
-    db::{CustomIconId, Entry, EntryId, Group, GroupId, GroupRef, History, MoveGroupError, Times},
+    db::{
+        CustomIconId, Entry, EntryId, EntryMut, Group, GroupId, GroupMut, GroupRef, History, MoveGroupError,
+        Times,
+    },
     Database,
 };
 
@@ -362,12 +365,34 @@ fn merge_groups(
         });
 
         if dest_last_modification == source_last_modification {
-            if have_groups_diverged(&dest, &source) {
-                // This should never happen.
-                //
-                // A group was updated without updating the last modification timestamp.
-                return Err(MergeError::GroupModificationTimeNotUpdated(id));
+            if !have_groups_diverged(&dest, &source) {
+                continue;
             }
+            // Divergent content at the same timestamp — resolve as a three-way conflict when an
+            // ancestor is present; the two-way `merge` shim keeps its historical hard error.
+            let Some(base_group) = base_db.group(id) else {
+                return Err(MergeError::GroupModificationTimeNotUpdated(id));
+            };
+            let dest_changed = have_groups_diverged(&dest, &base_group);
+            let source_changed = have_groups_diverged(&source, &base_group);
+
+            if dest_changed && source_changed {
+                log.warnings.push(format!(
+                    "Group {id} was modified in both databases at the same timestamp since the \
+                     common ancestor. Resolving by keeping the destination copy.",
+                ));
+                continue;
+            }
+            if !source_changed {
+                continue;
+            }
+
+            // Only the source changed — adopt it despite the equal timestamp.
+            overwrite_group_fields(&mut dest, &source);
+            log.events.push(MergeEvent {
+                target: MergeEventTarget::Group(id),
+                event_type: MergeEventType::Updated,
+            });
             continue;
         }
 
@@ -394,16 +419,7 @@ fn merge_groups(
         }
 
         // The source group is more recent than the destination group. Update dest with source.
-        dest.name = source.name.clone();
-        dest.notes = source.notes.clone();
-        dest.icon = source.icon.clone();
-        dest.custom_data = source.custom_data.clone();
-        dest.times.last_modification = source.times.last_modification.or(dest.times.last_modification);
-        dest.is_expanded = source.is_expanded;
-        dest.default_autotype_sequence = source.default_autotype_sequence.clone();
-        dest.enable_autotype = source.enable_autotype;
-        dest.enable_searching = source.enable_searching;
-        dest.last_top_visible_entry = source.last_top_visible_entry;
+        overwrite_group_fields(&mut dest, &source);
 
         log.events.push(MergeEvent {
             target: MergeEventTarget::Group(id),
@@ -438,6 +454,18 @@ fn merge_entries(
 
         // was the entry deleted in dest?
         if let Some(deletion_time) = dest_db.deleted_objects.get(&id.uuid()) {
+            // Delete-vs-edit conflict: deleted in the destination, still present in the source.
+            // If it existed in the ancestor and the source edited it since, that is a two-sided
+            // divergent change — surface it (the timestamp logic below still decides the outcome).
+            if let Some(base_entry) = base_db.entry(id) {
+                if have_entries_diverged(&source_entry, source_db, &base_entry, base_db) {
+                    log.warnings.push(format!(
+                        "Entry {id} was deleted in the destination but modified in the source \
+                         since the common ancestor.",
+                    ));
+                }
+            }
+
             // get the last modification or location change time in source.
             let source_update_time = source_entry
                 .times
@@ -500,6 +528,23 @@ fn merge_entries(
 
     // Handle entries that exist only in destination. These entries might need to be deleted.
     for &id in dest_entries.difference(&source_entries) {
+        // Delete-vs-edit conflict: present in the destination, tombstoned in the source. If it
+        // existed in the ancestor and the destination edited it since, that is a two-sided
+        // divergent change — surface it before the deletion logic decides the outcome. Computed
+        // here so the immutable borrow ends before the mutable `entry_mut` below.
+        if source_db.deleted_objects.contains_key(&id.uuid()) {
+            if let Some(base_entry) = base_db.entry(id) {
+                #[allow(clippy::unwrap_used)] // id is guaranteed to exist in dest
+                let dest_entry_ref = dest_db.entry(id).unwrap();
+                if have_entries_diverged(&dest_entry_ref, dest_db, &base_entry, base_db) {
+                    log.warnings.push(format!(
+                        "Entry {id} was modified in the destination but deleted in the source \
+                         since the common ancestor.",
+                    ));
+                }
+            }
+        }
+
         #[allow(clippy::unwrap_used)] // id is guaranteed to exist
         let dest_entry = dest_db.entry_mut(id).unwrap();
 
@@ -597,12 +642,53 @@ fn merge_entries(
         });
 
         if dest_last_modification == source_last_modification {
-            if have_entries_diverged(&dest_entry_snapshot, dest_db, &source_entry, source_db) {
-                // This should never happen.
-                //
-                // An entry was updated without updating the last modification timestamp.
-                return Err(MergeError::EntryModificationTimeNotUpdated(id));
+            if !have_entries_diverged(&dest_entry_snapshot, dest_db, &source_entry, source_db) {
+                // Identical content at the same timestamp — nothing to do.
+                continue;
             }
+
+            // Divergent content at the same timestamp (KDBX timestamps have one-second
+            // precision, so two branches can edit within the same second). Without an ancestor
+            // we cannot tell which side is authoritative, so the two-way `merge` shim keeps its
+            // historical hard error. With an ancestor, resolve it as a three-way conflict.
+            let Some(base_entry) = base_db.entry(id) else {
+                return Err(MergeError::EntryModificationTimeNotUpdated(id));
+            };
+            let dest_changed = have_entries_diverged(&dest_entry_snapshot, dest_db, &base_entry, base_db);
+            let source_changed = have_entries_diverged(&source_entry, source_db, &base_entry, base_db);
+
+            if dest_changed && source_changed {
+                // Both sides changed the entry differently within the same timestamp — a true
+                // conflict with no newer side. Deterministic tie-break: keep the destination.
+                log.warnings.push(format!(
+                    "Entry {id} was modified in both databases at the same timestamp since the \
+                     common ancestor. Resolving by keeping the destination copy.",
+                ));
+                continue;
+            }
+            if !source_changed {
+                // Only the destination changed (or neither) — keep the destination.
+                continue;
+            }
+
+            // Only the source changed — adopt it despite the equal timestamp, archiving the
+            // destination's pre-image into history.
+            let mut incoming = source_entry.deref().clone();
+            incoming.history = None;
+            incoming.remap_attachments(source_db, dest_db);
+
+            let mut archived = dest_entry_snapshot.clone();
+            archived.history = None;
+
+            #[allow(clippy::unwrap_used)] // id is guaranteed to exist in both dest and source
+            let mut dest_entry = dest_db.entry_mut(id).unwrap();
+            dest_entry.history.get_or_insert_default().add_entry(archived);
+            overwrite_entry_fields(&mut dest_entry, incoming);
+
+            log.events.push(MergeEvent {
+                target: MergeEventTarget::Entry(id),
+                event_type: MergeEventType::Updated,
+            });
             continue;
         }
 
@@ -665,17 +751,7 @@ fn merge_entries(
 
             #[allow(clippy::unwrap_used)] // id is guaranteed to exist in both dest and source
             let mut dest_entry = dest_db.entry_mut(id).unwrap();
-            dest_entry.times.last_modification = incoming.times.last_modification;
-            dest_entry.fields = incoming.fields;
-            dest_entry.autotype = incoming.autotype;
-            dest_entry.tags = incoming.tags;
-            dest_entry.custom_data = incoming.custom_data;
-            dest_entry.icon = incoming.icon;
-            dest_entry.foreground_color = incoming.foreground_color;
-            dest_entry.background_color = incoming.background_color;
-            dest_entry.override_url = incoming.override_url;
-            dest_entry.quality_check = incoming.quality_check;
-            dest_entry.attachments = incoming.attachments;
+            overwrite_entry_fields(&mut dest_entry, incoming);
 
             log.events.push(MergeEvent {
                 target: MergeEventTarget::Entry(id),
@@ -893,23 +969,23 @@ fn merge_icons(
             continue;
         }
 
-        // Three-way check (see `merge_entries`). Icons that predate the ancestor timestamp map to
-        // `epoch`, and the warning is gated on the id existing in the ancestor, so the two-way
-        // shim's empty ancestor makes this a no-op overlay.
-        let base_last_modification = base_db
+        // Three-way check (see `merge_entries`). The base timestamp is kept as an `Option` — not
+        // collapsed to `epoch` — so the two-way shim's empty ancestor (`None`) treats both sides
+        // as changed and never early-continues, preserving two-way behavior for pre-1970 icon
+        // timestamps.
+        let base_lm = base_db
             .custom_icons
             .get(&id)
-            .and_then(|i| i.last_modification_time)
-            .unwrap_or_else(Times::epoch);
-        let dest_changed = dest_last_modification > base_last_modification;
-        let source_changed = source_last_modification > base_last_modification;
+            .and_then(|i| i.last_modification_time);
+        let dest_changed = base_lm.is_none_or(|b| dest_last_modification > b);
+        let source_changed = base_lm.is_none_or(|b| source_last_modification > b);
 
         if !source_changed {
             // The source contributed nothing since the ancestor; keep the destination as-is.
             continue;
         }
 
-        if dest_changed && dest_icon != source_icon && base_db.custom_icons.contains_key(&id) {
+        if dest_changed && base_lm.is_some() && dest_icon != source_icon {
             log.warnings.push(format!(
                 "Custom icon {id} was modified in both databases since the common ancestor. \
                  Resolving by keeping the most recently modified version.",
@@ -931,6 +1007,21 @@ fn merge_icons(
     }
 
     Ok(())
+}
+
+/// Overwrite `dest`'s content fields from `source`. Location and child membership are not
+/// touched. Kept in sync with the field set compared by [`have_groups_diverged`].
+fn overwrite_group_fields(dest: &mut GroupMut<'_>, source: &Group) {
+    dest.name = source.name.clone();
+    dest.notes = source.notes.clone();
+    dest.icon = source.icon.clone();
+    dest.custom_data = source.custom_data.clone();
+    dest.times.last_modification = source.times.last_modification.or(dest.times.last_modification);
+    dest.is_expanded = source.is_expanded;
+    dest.default_autotype_sequence = source.default_autotype_sequence.clone();
+    dest.enable_autotype = source.enable_autotype;
+    dest.enable_searching = source.enable_searching;
+    dest.last_top_visible_entry = source.last_top_visible_entry;
 }
 
 fn have_groups_diverged(a: &Group, b: &Group) -> bool {
@@ -962,11 +1053,29 @@ fn have_entries_diverged(a: &Entry, a_db: &Database, b: &Entry, b_db: &Database)
     !a.content_equivalent(a_db, b, b_db)
 }
 
+/// Overwrite `dest_entry`'s content fields — everything except history and location — from
+/// `incoming`, taking ownership of `incoming`'s data. `incoming`'s attachment references must
+/// already be remapped into `dest_entry`'s database pool (see [`Entry::remap_attachments`]).
+fn overwrite_entry_fields(dest_entry: &mut EntryMut<'_>, incoming: Entry) {
+    dest_entry.times.last_modification = incoming.times.last_modification;
+    dest_entry.fields = incoming.fields;
+    dest_entry.autotype = incoming.autotype;
+    dest_entry.tags = incoming.tags;
+    dest_entry.custom_data = incoming.custom_data;
+    dest_entry.icon = incoming.icon;
+    dest_entry.foreground_color = incoming.foreground_color;
+    dest_entry.background_color = incoming.background_color;
+    dest_entry.override_url = incoming.override_url;
+    dest_entry.quality_check = incoming.quality_check;
+    dest_entry.attachments = incoming.attachments;
+}
+
 #[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod merge_tests {
     use uuid::uuid;
 
+    use super::MergeError;
     use crate::db::{fields, AttachmentId, EntryId, GroupId, History, Times};
     use crate::Database;
 
@@ -3195,6 +3304,327 @@ mod merge_tests {
         assert_eq!(
             attachment_bytes(&destination_db, ENTRY1_ID, "keep.txt").as_deref(),
             Some(b"orig".as_slice()),
+        );
+    }
+
+    // ---- equal-timestamp three-way conflict tests (PR #13 review, P1) ----
+    //
+    // KDBX timestamps have one-second precision, so two branches can make divergent edits within
+    // the same second. With an ancestor these must resolve (warn + deterministic keep-destination)
+    // instead of hard-erroring; without one, the two-way `merge` shim keeps its legacy error.
+
+    fn set_group_name(db: &mut Database, id: GroupId, name: &str) {
+        db.group_mut(id).unwrap().name = name.to_string();
+    }
+
+    fn set_group_lm(db: &mut Database, id: GroupId, at: chrono::NaiveDateTime) {
+        db.group_mut(id).unwrap().times.last_modification = Some(at);
+    }
+
+    /// Both sides edited the same entry differently within the same second: one warning, and the
+    /// deterministic tie-break keeps the destination.
+    #[test]
+    fn test_equal_timestamp_true_conflict_keeps_destination() {
+        let mut ancestor_db = create_test_database();
+        set_title(&mut ancestor_db, ENTRY1_ID, "base");
+        set_last_modification(&mut ancestor_db, ENTRY1_ID, ts_at(0));
+
+        let mut destination_db = ancestor_db.clone();
+        let mut source_db = ancestor_db.clone();
+
+        set_title(&mut destination_db, ENTRY1_ID, "dest_edit");
+        set_last_modification(&mut destination_db, ENTRY1_ID, ts_at(5));
+        set_title(&mut source_db, ENTRY1_ID, "source_edit");
+        set_last_modification(&mut source_db, ENTRY1_ID, ts_at(5));
+
+        let result = destination_db
+            .merge_with_ancestor(&source_db, &ancestor_db)
+            .unwrap();
+
+        assert_eq!(
+            result.warnings.len(),
+            1,
+            "same-timestamp two-sided edit must warn once"
+        );
+        assert_eq!(result.events.len(), 0);
+        assert_eq!(
+            title(&destination_db, ENTRY1_ID).as_deref(),
+            Some("dest_edit"),
+            "the deterministic tie-break keeps the destination copy"
+        );
+    }
+
+    /// Same timestamp, but only the source diverged from the ancestor: adopt the source, no warning.
+    #[test]
+    fn test_equal_timestamp_one_sided_source_adopts_source() {
+        let mut ancestor_db = create_test_database();
+        set_title(&mut ancestor_db, ENTRY1_ID, "base");
+        set_last_modification(&mut ancestor_db, ENTRY1_ID, ts_at(0));
+
+        let mut destination_db = ancestor_db.clone();
+        let mut source_db = ancestor_db.clone();
+
+        // Destination keeps the ancestor's content but shares the source's timestamp.
+        set_last_modification(&mut destination_db, ENTRY1_ID, ts_at(5));
+        set_title(&mut source_db, ENTRY1_ID, "source_edit");
+        set_last_modification(&mut source_db, ENTRY1_ID, ts_at(5));
+
+        let result = destination_db
+            .merge_with_ancestor(&source_db, &ancestor_db)
+            .unwrap();
+
+        assert_eq!(result.warnings.len(), 0, "a one-sided change must not warn");
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(title(&destination_db, ENTRY1_ID).as_deref(), Some("source_edit"));
+    }
+
+    /// Same timestamp, but only the destination diverged: keep the destination, no warning/event.
+    #[test]
+    fn test_equal_timestamp_one_sided_dest_keeps_destination() {
+        let mut ancestor_db = create_test_database();
+        set_title(&mut ancestor_db, ENTRY1_ID, "base");
+        set_last_modification(&mut ancestor_db, ENTRY1_ID, ts_at(0));
+
+        let mut destination_db = ancestor_db.clone();
+        let mut source_db = ancestor_db.clone();
+
+        set_title(&mut destination_db, ENTRY1_ID, "dest_edit");
+        set_last_modification(&mut destination_db, ENTRY1_ID, ts_at(5));
+        set_last_modification(&mut source_db, ENTRY1_ID, ts_at(5));
+
+        let result = destination_db
+            .merge_with_ancestor(&source_db, &ancestor_db)
+            .unwrap();
+
+        assert_eq!(result.warnings.len(), 0);
+        assert_eq!(result.events.len(), 0);
+        assert_eq!(title(&destination_db, ENTRY1_ID).as_deref(), Some("dest_edit"));
+    }
+
+    /// The two-way `merge` shim (no ancestor) must preserve the legacy hard error on an
+    /// equal-timestamp divergence.
+    #[test]
+    fn test_two_way_equal_timestamp_divergence_still_errors() {
+        let base = create_test_database();
+        let mut destination_db = base.clone();
+        let mut source_db = base;
+
+        set_title(&mut destination_db, ENTRY1_ID, "dest_edit");
+        set_last_modification(&mut destination_db, ENTRY1_ID, ts_at(5));
+        set_title(&mut source_db, ENTRY1_ID, "source_edit");
+        set_last_modification(&mut source_db, ENTRY1_ID, ts_at(5));
+
+        let err = destination_db.merge(&source_db).unwrap_err();
+        assert!(
+            matches!(err, MergeError::EntryModificationTimeNotUpdated(id) if id == ENTRY1_ID),
+            "two-way equal-timestamp divergence must still hard-error, got {err:?}"
+        );
+    }
+
+    /// Groups get the same equal-timestamp treatment: three-way warns (not errors)...
+    #[test]
+    fn test_equal_timestamp_group_conflict_warns() {
+        let mut ancestor_db = create_test_database();
+        set_group_name(&mut ancestor_db, SUBGROUP1_ID, "base");
+        set_group_lm(&mut ancestor_db, SUBGROUP1_ID, ts_at(0));
+
+        let mut destination_db = ancestor_db.clone();
+        let mut source_db = ancestor_db.clone();
+
+        set_group_name(&mut destination_db, SUBGROUP1_ID, "dest_name");
+        set_group_lm(&mut destination_db, SUBGROUP1_ID, ts_at(5));
+        set_group_name(&mut source_db, SUBGROUP1_ID, "source_name");
+        set_group_lm(&mut source_db, SUBGROUP1_ID, ts_at(5));
+
+        let result = destination_db
+            .merge_with_ancestor(&source_db, &ancestor_db)
+            .unwrap();
+
+        assert_eq!(result.warnings.len(), 1);
+        assert_eq!(destination_db.group(SUBGROUP1_ID).unwrap().name, "dest_name");
+    }
+
+    /// ...while the two-way shim still hard-errors on an equal-timestamp group divergence.
+    #[test]
+    fn test_two_way_equal_timestamp_group_divergence_still_errors() {
+        let base = create_test_database();
+        let mut destination_db = base.clone();
+        let mut source_db = base;
+
+        set_group_name(&mut destination_db, SUBGROUP1_ID, "dest_name");
+        set_group_lm(&mut destination_db, SUBGROUP1_ID, ts_at(5));
+        set_group_name(&mut source_db, SUBGROUP1_ID, "source_name");
+        set_group_lm(&mut source_db, SUBGROUP1_ID, ts_at(5));
+
+        let err = destination_db.merge(&source_db).unwrap_err();
+        assert!(
+            matches!(err, MergeError::GroupModificationTimeNotUpdated(id) if id == SUBGROUP1_ID),
+            "two-way equal-timestamp group divergence must still hard-error, got {err:?}"
+        );
+    }
+
+    // ---- tombstone delete-vs-edit conflict tests (PR #13 review, P2) ----
+
+    /// Deleted in the destination, edited in the source since the ancestor → conflict warning.
+    #[test]
+    fn test_tombstone_conflict_deleted_in_dest_edited_in_source() {
+        let mut ancestor_db = create_test_database();
+        set_title(&mut ancestor_db, ENTRY1_ID, "base");
+        set_last_modification(&mut ancestor_db, ENTRY1_ID, ts_at(0));
+
+        let mut destination_db = ancestor_db.clone();
+        let mut source_db = ancestor_db.clone();
+
+        destination_db
+            .entry_mut(ENTRY1_ID)
+            .unwrap()
+            .track_changes()
+            .remove();
+        set_title(&mut source_db, ENTRY1_ID, "edited_in_source");
+        set_last_modification(&mut source_db, ENTRY1_ID, ts_at(5));
+
+        let result = destination_db
+            .merge_with_ancestor(&source_db, &ancestor_db)
+            .unwrap();
+
+        assert_eq!(
+            result.warnings.len(),
+            1,
+            "editing an entry the other side deleted is a conflict"
+        );
+    }
+
+    /// Edited in the destination, deleted in the source since the ancestor → conflict warning.
+    #[test]
+    fn test_tombstone_conflict_edited_in_dest_deleted_in_source() {
+        let mut ancestor_db = create_test_database();
+        set_title(&mut ancestor_db, ENTRY1_ID, "base");
+        set_last_modification(&mut ancestor_db, ENTRY1_ID, ts_at(0));
+
+        let mut destination_db = ancestor_db.clone();
+        let mut source_db = ancestor_db.clone();
+
+        set_title(&mut destination_db, ENTRY1_ID, "edited_in_dest");
+        set_last_modification(&mut destination_db, ENTRY1_ID, ts_at(5));
+        source_db.entry_mut(ENTRY1_ID).unwrap().track_changes().remove();
+
+        let result = destination_db
+            .merge_with_ancestor(&source_db, &ancestor_db)
+            .unwrap();
+
+        assert_eq!(result.warnings.len(), 1);
+    }
+
+    /// A one-sided delete (the surviving side is unchanged vs the ancestor) is not a conflict.
+    #[test]
+    fn test_tombstone_one_sided_delete_is_silent() {
+        let mut ancestor_db = create_test_database();
+        set_title(&mut ancestor_db, ENTRY1_ID, "base");
+        set_last_modification(&mut ancestor_db, ENTRY1_ID, ts_at(0));
+
+        let mut destination_db = ancestor_db.clone();
+        let source_db = ancestor_db.clone();
+
+        // Only the destination deletes; the source keeps the ancestor's version unchanged.
+        destination_db
+            .entry_mut(ENTRY1_ID)
+            .unwrap()
+            .track_changes()
+            .remove();
+
+        let result = destination_db
+            .merge_with_ancestor(&source_db, &ancestor_db)
+            .unwrap();
+
+        assert_eq!(
+            result.warnings.len(),
+            0,
+            "a one-sided delete with no competing edit must not warn"
+        );
+    }
+
+    // ---- custom-icon three-way tests (PR #13 review, P3) ----
+
+    fn old_time(year: i32, month: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(year, month, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+    }
+
+    /// Regression: the two-way shim must still take a newer source icon even when both timestamps
+    /// predate the Unix epoch (the old code collapsed an absent ancestor to `epoch` and kept dest).
+    #[test]
+    fn test_two_way_icon_pre_epoch_source_newer_wins() {
+        let mut destination_db = create_test_database();
+        let icon_id = destination_db
+            .entry_mut(ENTRY1_ID)
+            .unwrap()
+            .set_icon_custom_new(vec![1, 2, 3, 4])
+            .id();
+        let mut source_db = destination_db.clone();
+
+        destination_db
+            .custom_icon_mut(icon_id)
+            .unwrap()
+            .last_modification_time = Some(old_time(1969, 1));
+        {
+            let mut source_icon = source_db.custom_icon_mut(icon_id).unwrap();
+            source_icon.data = vec![5, 6, 7, 8];
+            source_icon.last_modification_time = Some(old_time(1969, 6));
+        }
+
+        let result = destination_db.merge(&source_db).unwrap();
+
+        assert_eq!(result.warnings.len(), 0);
+        assert_eq!(
+            destination_db.custom_icon(icon_id).unwrap().data,
+            vec![5, 6, 7, 8],
+            "a newer source icon must win even for pre-1970 timestamps"
+        );
+    }
+
+    /// Three-way: an icon changed differently on both sides since the ancestor warns, newest wins.
+    #[test]
+    fn test_ancestor_icon_conflict_warns_and_newest_wins() {
+        let mut ancestor_db = create_test_database();
+        let icon_id = ancestor_db
+            .entry_mut(ENTRY1_ID)
+            .unwrap()
+            .set_icon_custom_new(vec![0, 0, 0, 0])
+            .id();
+        ancestor_db
+            .custom_icon_mut(icon_id)
+            .unwrap()
+            .last_modification_time = Some(ts_at(0));
+
+        let mut destination_db = ancestor_db.clone();
+        let mut source_db = ancestor_db.clone();
+
+        {
+            let mut di = destination_db.custom_icon_mut(icon_id).unwrap();
+            di.data = vec![9, 9, 9, 9];
+            di.last_modification_time = Some(ts_at(5));
+        }
+        {
+            let mut si = source_db.custom_icon_mut(icon_id).unwrap();
+            si.data = vec![8, 8, 8, 8];
+            si.last_modification_time = Some(ts_at(10));
+        }
+
+        let result = destination_db
+            .merge_with_ancestor(&source_db, &ancestor_db)
+            .unwrap();
+
+        assert_eq!(
+            result.warnings.len(),
+            1,
+            "diverged icons since the ancestor are a conflict"
+        );
+        assert_eq!(
+            destination_db.custom_icon(icon_id).unwrap().data,
+            vec![8, 8, 8, 8],
+            "the most recently modified icon must win"
         );
     }
 }
