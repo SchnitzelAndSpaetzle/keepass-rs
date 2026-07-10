@@ -3417,7 +3417,8 @@ mod merge_tests {
         let err = destination_db.merge(&source_db).unwrap_err();
         assert!(
             matches!(err, MergeError::EntryModificationTimeNotUpdated(id) if id == ENTRY1_ID),
-            "two-way equal-timestamp divergence must still hard-error, got {err:?}"
+            "two-way equal-timestamp divergence must still hard-error, got {:?}",
+            err
         );
     }
 
@@ -3459,7 +3460,8 @@ mod merge_tests {
         let err = destination_db.merge(&source_db).unwrap_err();
         assert!(
             matches!(err, MergeError::GroupModificationTimeNotUpdated(id) if id == SUBGROUP1_ID),
-            "two-way equal-timestamp group divergence must still hard-error, got {err:?}"
+            "two-way equal-timestamp group divergence must still hard-error, got {:?}",
+            err
         );
     }
 
